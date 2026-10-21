@@ -63,14 +63,8 @@ func (p *Publicador) Publicar(ctx context.Context, exchange, routingKey string, 
 	return nil
 }
 
-// PublicarECommerce é o atalho para a exchange direct, usada por todo o
-// fluxo de pedidos.
+// PublicarECommerce é o atalho para a exchange direct, por onde passam todos
+// os eventos do sistema.
 func (p *Publicador) PublicarECommerce(ctx context.Context, routingKey string, dados any) error {
 	return p.Publicar(ctx, evento.ExchangeECommerce, routingKey, dados)
-}
-
-// PublicarPromocao é o atalho para a exchange topic, usada só pelo
-// microsserviço Promoções.
-func (p *Publicador) PublicarPromocao(ctx context.Context, categoria string, dados any) error {
-	return p.Publicar(ctx, evento.ExchangePromocoes, evento.ChavePromocao(categoria), dados)
 }

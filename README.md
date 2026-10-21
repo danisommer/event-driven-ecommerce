@@ -1,84 +1,223 @@
-# E-commerce orientado a eventos
+# E-commerce em microsserviços
 
-Backend de e-commerce em Go dividido em microsserviços que conversam **só** por
-eventos no RabbitMQ. Nenhum processo chama outro diretamente. Todo evento sai
-assinado digitalmente (RSA) e é validado por quem o recebe.
+Loja virtual dividida em microsserviços. O frontend web fala por REST com um
+API Gateway, que recebe as mudanças de status dos pedidos em tempo real por
+SSE. Os serviços de domínio conversam só por eventos no RabbitMQ, todos
+assinados com RSA. O pagamento passa por um provedor externo simulado, que
+avisa o resultado por webhook, e as promoções saem por e-mail pela Resend.
 
-## Processos
+Regra de linguagem: o que fala com o RabbitMQ é Go; o que não fala (Mock de
+Pagamento e servidor do frontend) é Python; o frontend é HTML, CSS e
+JavaScript.
 
-| Processo | Comando | O que faz |
-|---|---|---|
-| Principal | `make principal` | menu de terminal: vitrine, pedidos e status em tempo real |
-| Estoque | `make estoque` | reserva os itens do pedido e devolve quando ele é cancelado |
-| Pagamento | `make pagamento` | aprova ou recusa o pagamento (simulado) |
-| Entrega | `make entrega` | emite nota fiscal e código de rastreio (simulado) |
-| Promoções | `make promocoes` | publica uma promoção aleatória a cada 3 a 8 segundos |
-| Consumidor C1 | `make c1` | recebe promoções das categorias A e B |
-| Consumidor C2 | `make c2` | recebe promoções de todas as categorias |
+## Arquitetura
+
+```
+Frontend (HTML/CSS/JS, :5173)
+   │  REST + SSE
+   ▼
+Principal / API Gateway (Go, :8080) ──REST──▶ Estoque (Go, :8081, SQLite)
+   │  ▲
+   ▼  │   exchange eCommerce no RabbitMQ (eventos assinados com RSA)
+   ├────────────┬──────────────────┬────────────┐
+Estoque     Pagamento (Go, :8082)  Entrega     Promoções (Go, SQLite)
+               │  ▲                               │
+ cria cobrança │  │ webhook                       └──▶ API de e-mail (Resend)
+               ▼  │
+       Mock de Pagamento (Python, :8090) ◀── aba aberta pelo navegador
+```
+
+| Processo | Linguagem | Porta | Comando | Papel |
+|---|---|---|---|---|
+| Frontend | HTML/CSS/JS | 5173 | `make frontend` | catálogo, carrinho, acompanhamento dos pedidos, inscrição em promoções |
+| Principal (API Gateway) | Go | 8080 | `make principal` | API REST do frontend, conexões SSE, eventos das ações do usuário |
+| Estoque | Go | 8081 | `make estoque` | saldo, reservas e preços promocionais no SQLite, `GET /produtos` |
+| Pagamento | Go | 8082 | `make pagamento` | cria a cobrança no Mock, recebe o webhook |
+| Entrega | Go | — | `make entrega` | emite nota fiscal e despacha |
+| Promoções | Go | — | `make promocoes` | guarda as inscrições no SQLite, cria as promoções e as envia por e-mail |
+| Mock de Pagamento | Python (Flask) | 8090 | `make mock-pagamento` | provedor de pagamento externo: página com "Aprovado" e "Recusado" |
+| RabbitMQ | — | 5672 / 15672 | `make broker` | broker; painel em http://localhost:15672 (guest / guest) |
 
 ## Como rodar
 
-Pré-requisitos: Go 1.26+ (versão do `go.mod`), Docker e `make`.
+Pré-requisitos: Go 1.26+, Docker, Python 3 com venv (no Ubuntu,
+`sudo apt install python3-venv`) e `make`.
+
+Uma vez só:
 
 ```bash
-make broker     # RabbitMQ; painel em http://localhost:15672 (guest / guest)
-make chaves     # opcional: as chaves já vêm no repositório e rodar de novo não as troca
+make mock-instalar                      # venv do Mock com Flask e requests
+echo 'RESEND_API_KEY=re_...' > .env     # opcional: sem a chave, os e-mails só aparecem no log
 ```
 
-Depois, um processo por terminal:
+O `.env` está no `.gitignore` e o Makefile o carrega em todo `make`.
+
+Depois, um processo por terminal, nesta ordem:
 
 ```bash
+make broker
 make estoque
+make mock-pagamento        # antes do Pagamento
 make pagamento
 make entrega
-make principal  # o menu; pede seu nome e mostra as opções
+make promocoes             # na demonstração: PROMOCOES_INTERVALO=20s make promocoes
+make principal
+make frontend
 ```
 
-Para as promoções, suba os consumidores **antes** do gerador. A fila de cada
-consumidor só passa a existir quando ele sobe pela primeira vez, e promoção
-publicada sem fila vinculada se perde.
+Abra http://localhost:5173. Os serviços Go tentam conectar no broker por até
+1 minuto, então podem subir enquanto o RabbitMQ ainda inicia. `Ctrl+C` encerra
+qualquer processo e `make` sozinho lista todos os comandos.
 
-```bash
-make c1
-make c2
-make promocoes
-```
+## Fluxo de um pedido
 
-Os serviços tentam conectar no broker por até 1 minuto, então dá para subir tudo
-enquanto o RabbitMQ ainda está iniciando. `Ctrl+C` encerra qualquer processo e
-`make` sozinho lista todos os comandos.
+1. O frontend lista os produtos: `GET /produtos` no Gateway, que consulta o
+   Estoque por REST.
+2. Ao finalizar, o frontend abre uma aba de "aguardando pagamento" e faz
+   `POST /pedidos` com `cliente_id` e os itens (só produto e quantidade). O
+   Gateway busca nome e preço no Estoque (já com o desconto, se houver
+   promoção válida), registra o pedido, publica `pedido.criado` e responde
+   `202`.
+3. O Estoque reserva os itens numa transação e publica `pedido.estoque_ok`, ou
+   `estoque.indisponivel` sem mexer no saldo.
+4. O Pagamento cria a cobrança no Mock (`POST /cobrancas`, informando a URL do
+   seu webhook) e publica `pagamento.pendente` com a `url_checkout`. O Gateway
+   repassa por SSE, e o frontend leva a aba aberta no passo 2 até a página do
+   Mock.
+5. O comprador clica em "Pagamento Aprovado" ou "Pagamento Recusado". O servidor
+   do Mock faz `POST` no webhook do Pagamento, que publica `pagamento.aprovado`
+   ou `pagamento.recusado`.
+6. A Entrega recebe `pagamento.aprovado` e publica `pedido.enviado`.
+7. Em recusa ou falta de estoque, o Gateway publica `pedido.excluido`: o Estoque
+   devolve a reserva e o Pagamento cancela a cobrança pendente.
 
-## Fluxo dos eventos
+Cada mudança chega ao navegador pelo SSE. Os status, como códigos estáveis:
 
-Exchange `eCommerce`, tipo `direct`:
+| Status | Evento que leva a ele | Encerrado |
+|---|---|---|
+| `aguardando_estoque` | `POST /pedidos` | não |
+| `estoque_confirmado` | `pedido.estoque_ok` | não |
+| `aguardando_pagamento` | `pagamento.pendente` (traz `url_checkout`) | não |
+| `pagamento_aprovado` | `pagamento.aprovado` | não |
+| `enviado` | `pedido.enviado` | sim |
+| `sem_estoque` | `estoque.indisponivel` | sim |
+| `pagamento_recusado` | `pagamento.recusado` | sim |
+| `cancelado` | `DELETE /pedidos/{id}` | sim |
 
-```
-Principal ── pedido.criado ────────▶ Estoque
-Estoque   ── pedido.estoque_ok ────▶ Pagamento e Principal
-Estoque   ── estoque.indisponivel ─▶ Principal
-Pagamento ── pagamento.aprovado ───▶ Entrega e Principal
-Pagamento ── pagamento.recusado ───▶ Principal
-Entrega   ── pedido.enviado ───────▶ Principal
-Principal ── pedido.excluido ──────▶ Estoque
-```
+Um pedido encerrado ignora eventos que cheguem depois.
 
-Quando o pedido é cancelado (sem estoque, pagamento recusado ou exclusão pelo
-usuário), o Principal publica `pedido.excluido` e o Estoque devolve o que tinha
-reservado.
+## Eventos
 
-Exchange `promocoes`, tipo `topic`:
+Todos passam pela exchange `eCommerce`, do tipo `direct`:
 
-```
-Promoções ── promocao.categoria.A|B|C ─▶ C1 (binding A e B) e C2 (binding #)
-```
+| Routing key | Produtor | Consumidores |
+|---|---|---|
+| `pedido.criado` | Principal | Estoque |
+| `pedido.excluido` | Principal | Estoque, Pagamento |
+| `pedido.estoque_ok` | Estoque | Pagamento, Principal |
+| `estoque.indisponivel` | Estoque | Principal |
+| `pagamento.pendente` | Pagamento | Principal |
+| `pagamento.aprovado` | Pagamento | Entrega, Principal |
+| `pagamento.recusado` | Pagamento | Principal |
+| `pedido.enviado` | Entrega | Principal |
+| `interesse.promocao` | Principal | Promoções |
+| `interesse.cancelado` | Principal | Promoções |
+| `promocao.criada` | Promoções | Estoque |
 
 Cada processo tem a sua fila durável: `principal.status`, `estoque.pedidos`,
-`pagamento.estoque_ok`, `entrega.pagamentos`, `promocoes.c1` e `promocoes.c2`.
+`pagamento.estoque_ok`, `entrega.pagamentos` e `promocoes.interesses`.
 
-## Catálogo
+## API do Gateway (`:8080`)
 
-O catálogo é fixo. O estoque fica em memória no Estoque: reiniciar o processo
-volta às quantidades iniciais.
+Erros sempre como `{"erro": "mensagem"}`. O CORS libera as origens de
+`FRONTEND_ORIGEM`.
+
+| Método | Caminho | Corpo | Resposta |
+|---|---|---|---|
+| GET | `/produtos` | — | 200 lista de produtos com saldo; 502 se o Estoque não responder |
+| POST | `/pedidos` | `{cliente_id, cliente, itens: [{produto_id, quantidade}]}` | 202 pedido; 400 validação; 502 Estoque fora; 503 broker fora |
+| GET | `/pedidos?cliente_id=` | — | 200 pedidos do cliente |
+| DELETE | `/pedidos/{id}?cliente_id=` | — | 202 pedido cancelado; 404 de outro cliente ou inexistente; 409 já encerrado |
+| GET | `/eventos?cliente_id=` | — | 200 `text/event-stream` |
+| POST | `/interesses` | `{email, categorias: ["A", "C"]}` | 202; 400 e-mail ou categoria inválidos |
+| DELETE | `/interesses/{email}` | — | 202 |
+
+O SSE manda o pedido inteiro a cada mudança, e um comentário a cada 15 s para
+a conexão não cair por inatividade:
+
+```
+event: pedido
+data: {"id":"PED-942622","status":"aguardando_pagamento","url_checkout":"http://localhost:8090/checkout/COB-da52a7e0", ...}
+
+: ping
+```
+
+O `cliente_id` é gerado pelo frontend na primeira visita e guardado no
+navegador; é ele que liga o SSE aos pedidos do cliente. Duas abas do mesmo
+navegador recebem as mesmas mudanças.
+
+## APIs entre serviços
+
+| Serviço | Método e caminho | Uso |
+|---|---|---|
+| Estoque | `GET /produtos` | produtos com `quantidade > 0`; `preco` é o que vale agora e `preco_original` aparece quando há promoção |
+| Estoque | `GET /produtos/{id}` | produto com qualquer saldo (o Gateway busca o preço aqui); 404 se não existe |
+| Mock | `POST /cobrancas` `{pedido_id, valor, webhook_url}` | 201 `{cobranca_id, url_checkout}` |
+| Mock | `GET /checkout/{id}` | página com os dois botões |
+| Mock | `POST /checkout/{id}` | o servidor do Mock chama o webhook; 409 se já decidida |
+| Pagamento | `POST /webhook/pagamento` `{cobranca_id, pedido_id, status}` | 200 (também para aviso repetido); 400 status inválido; 404 cobrança desconhecida |
+
+## Promoções por e-mail
+
+O frontend inscreve um e-mail em uma ou mais categorias. Inscrever de novo troca
+as categorias; cancelar remove todas. O Promoções guarda as inscrições no
+SQLite e, a cada `PROMOCOES_INTERVALO` (padrão `2m`), sorteia um produto entre
+as categorias que têm inscritos e um desconto de 5% a 44%, válido por 1 a 9
+horas. Então:
+
+1. Publica `promocao.criada`. O Estoque, dono do preço, guarda o preço
+   promocional com a validade; até lá, as consultas de produto (e com elas os
+   pedidos montados pelo Gateway) usam o preço com desconto. O desconto vale
+   para qualquer cliente; o e-mail só avisa os interessados.
+2. Envia um e-mail a cada inscrito da categoria pela API da Resend
+   (`POST https://api.resend.com/emails`).
+
+Se a publicação falhar, nenhum e-mail sai: a loja não anuncia um preço que não
+vai cobrar. Uma promoção nova para o mesmo produto substitui a anterior.
+
+Com o remetente de testes `onboarding@resend.dev`, a Resend só entrega para o
+e-mail dono da conta; os outros endereços recebem `403`, que aparece no log.
+Sem `RESEND_API_KEY`, os e-mails só são registrados no log.
+
+## Assinatura digital
+
+Todo evento carrega no envelope o campo `signature`: o SHA-256 do evento (sem
+esse campo) assinado com a chave privada RSA de quem publicou. Quem consome
+confere com a chave pública do `produtor` declarado e descarta o evento se não
+bater.
+
+Para ver um evento falso sendo descartado, publique pelo painel do RabbitMQ
+(*Exchanges* → `eCommerce` → *Publish message*), com a routing key
+`pedido.criado` e o payload:
+
+```json
+{"id":"falso","tipo":"pedido.criado","produtor":"principal","timestamp":"agora","dados":{"pedido_id":"PED-FALSO","itens":[]},"signature":"AAAA"}
+```
+
+O log do Estoque mostra `assinatura inválida no evento pedido.criado vindo de
+"principal", DESCARTADO`. Com `VERIFICAR_ASSINATURA=off make estoque`, a mesma
+mensagem é aceita e recusada por outro motivo (`pedido sem itens`).
+
+## Persistência
+
+| Dado | Onde |
+|---|---|
+| Produtos, saldo, reservas e preços promocionais | `estoque.db` (SQLite), criado com o catálogo abaixo na primeira execução |
+| Inscrições em promoções | `promocoes.db` (SQLite) |
+| Pedidos do Gateway, cobranças do Pagamento e do Mock | memória: reiniciar o processo apaga |
+
+`make zerar` apaga os dois bancos: o Estoque volta às quantidades e aos preços
+iniciais e ninguém fica inscrito.
 
 | Código | Produto | Categoria | Preço | Estoque inicial |
 |---|---|---|---|---|
@@ -92,161 +231,74 @@ volta às quantidades iniciais.
 | P008 | Tênis de corrida | C | R$ 350,00 | 30 |
 | P009 | Mochila 30L | C | R$ 210,00 | 12 |
 
-## Funcionalidades e como reproduzir
+## Roteiro de demonstração
 
-Os passos assumem o ambiente de [Como rodar](#como-rodar) no ar.
+Com tudo no ar (de preferência depois de `make zerar`):
 
-### 1. Ver a vitrine
+1. **Catálogo vindo do Estoque:** abra o frontend; o log do Estoque mostra o
+   `GET /produtos` feito pelo Gateway.
+2. **Pedido completo:** adicione um produto e finalize. A nova aba vai para o
+   Mock; clique em "Pagamento Aprovado". Em "Meus pedidos" o status passa por
+   Estoque confirmado → Aguardando pagamento → Pagamento aprovado → Pedido
+   enviado, sem recarregar a página.
+3. **Pagamento recusado:** repita e clique em "Pagamento Recusado". O pedido
+   fica recusado e o log do Estoque mostra os itens devolvidos.
+4. **Sem estoque:** peça 9 Air Fryers (`P006` começa com 8).
+5. **Cancelamento:** finalize um pedido, feche a aba do Mock sem pagar e use
+   "Cancelar pedido". O Estoque devolve a reserva e o Pagamento cancela a
+   cobrança.
+6. **Persistência:** reinicie o Estoque; o saldo continua o mesmo.
+7. **Duas abas:** abra o frontend em duas abas e faça um pedido; as duas
+   atualizam.
+8. **Promoções:** inscreva o e-mail da conta da Resend com
+   `PROMOCOES_INTERVALO=20s`; o e-mail chega e o log do Estoque mostra a
+   promoção registrada. Recarregue o frontend: o produto aparece com o preço
+   riscado e o selo de desconto, e um pedido dele sai com o preço promocional.
+   Cancele a inscrição e os envios param.
+9. **Assinatura:** publique o evento falso da seção acima.
 
-No menu, opção `1`. Lista os produtos com código, categoria e preço. A
-quantidade em estoque não aparece: ela pertence ao Estoque, e o Principal só
-descobre se o pedido cabe quando o evento de resposta chega.
+`make observador` mostra todos os eventos passando pela exchange num terminal
+só.
 
-### 2. Fazer um pedido que chega até o envio
-
-1. Opção `2`.
-2. Informe o produto (número da linha ou código, ex. `1` ou `P001`) e a
-   quantidade. Repita para adicionar mais itens; produto em branco fecha o pedido.
-3. Confirme com `s`.
-
-Em poucos segundos o status muda sozinho na tela:
-
-```
-  >> PED-3f9a1c → estoque reservado (itens reservados, seguindo para o pagamento)
-  >> PED-3f9a1c → pagamento aprovado (transação TX-9b2e4f1a7c30, R$ 4500.00)
-  >> PED-3f9a1c → enviado (nota 482913577, Correios, rastreio CR731904552BR)
-```
-
-O Pagamento aprova 70% dos pedidos por sorteio. Para garantir a aprovação, suba
-com `TAXA_APROVACAO=1 make pagamento`.
-
-### 3. Pedido cancelado por falta de estoque
-
-Peça mais do que existe. O Air Fryer (`P006`) começa com 8 unidades, então peça 9:
-
-```
-  >> PED-a1b2c3 → cancelado: sem estoque (estoque insuficiente de Air Fryer 5L: pedidas 9, disponíveis 8)
-```
-
-Se um item não cabe, nenhum item do pedido é reservado.
-
-### 4. Pedido cancelado no pagamento, com devolução ao estoque
-
-Suba o Pagamento recusando tudo com `TAXA_APROVACAO=0 make pagamento` e faça um
-pedido qualquer:
-
-```
-  >> PED-d4e5f6 → estoque reservado (itens reservados, seguindo para o pagamento)
-  >> PED-d4e5f6 → cancelado: pagamento recusado (cartão expirado)
-```
-
-O terminal do Estoque mostra a devolução:
-
-```
-pedido PED-d4e5f6 excluído (pagamento recusado: cartão expirado): 1 item(ns) devolvidos. Estoque agora: P001=10 ...
-```
-
-### 5. Excluir um pedido
-
-Só dá para excluir pedido que ainda não terminou (enviado ou cancelado, não).
-Como o fluxo completo leva poucos segundos, o jeito simples é travar o pedido
-no meio:
-
-1. Pare o Pagamento (`Ctrl+C`).
-2. Faça um pedido. Ele fica em `estoque reservado`.
-3. Opção `3`, escolha o pedido e confirme com `s`.
-
-O status vira `cancelado pelo usuário` e o terminal do Estoque mostra os itens
-devolvidos.
-
-Ao religar o Pagamento, ele ainda processa a mensagem desse pedido que ficou na
-fila, porque o Pagamento não escuta `pedido.excluido`. Para evitar, esvazie a
-fila antes no painel: *Queues* → `pagamento.estoque_ok` → *Purge Messages*.
-
-### 6. Consultar pedidos e histórico
-
-Opção `4`. Mostra os pedidos da sessão com o status atual. Escolhendo um número,
-mostra itens, total e cada mudança de status com o horário.
-
-Os pedidos ficam em memória no Principal: fechar o menu apaga a lista.
-
-### 7. Promoções por categoria
-
-Com `c1`, `c2` e `promocoes` no ar, o gerador sorteia um produto, aplica um
-desconto aleatório e publica com a routing key da categoria do produto. Nos
-terminais dos consumidores:
-
-```
-Nova promocao recebida! Categoria: B
-Dados: {ProdutoID:P006 Nome:Air Fryer 5L Categoria:B PrecoDe:450 PrecoPor:283.5 Desconto:37 ValidaAte:2026-09-17T19:40:12Z}
-```
-
-- C2 recebe **todas** as promoções.
-- C1 recebe só as das categorias **A e B**. Promoção da categoria C aparece no C2
-  e não no C1.
-
-A diferença está só nas binding keys: C1 se vincula a `promocao.categoria.A` e
-`promocao.categoria.B`; C2 usa `promocao.categoria.#`, que casa com qualquer
-categoria. A promoção é só um aviso, não muda o preço usado nos pedidos.
-
-### 8. Assinatura digital dos eventos
-
-Todo evento publicado carrega no envelope o campo `signature`: o hash SHA-256 do
-evento (sem esse campo) assinado com a chave privada RSA de quem publicou. Quem
-consome confere com a chave pública do `produtor` declarado no envelope e
-descarta o evento se não bater.
-
-**Ver funcionando.** Os logs de cada processo mostram quem assinou o que publicou
-e só registram o recebimento depois da validação:
-
-```
-→ publicado pedido.criado (evento 3f9a1c2b8e4d7601, assinado por principal)
-← recebido pedido.criado (evento 3f9a1c2b8e4d7601, produtor principal)
-```
-
-O log do Principal vai para `principal.log`, para não atrapalhar o menu. Acompanhe
-com `tail -f principal.log`.
-
-**Ver um evento falso sendo descartado.**
-
-1. No painel do RabbitMQ, abra *Exchanges* → `eCommerce` → *Publish message*.
-2. Em *Routing key*, `pedido.criado`. Em *Payload*:
-
-   ```json
-   {"id":"falso","tipo":"pedido.criado","produtor":"principal","timestamp":"agora","dados":{"pedido_id":"PED-FALSO","itens":[]},"signature":"AAAA"}
-   ```
-
-3. Clique em *Publish message*. O terminal do Estoque mostra:
-
-   ```
-   assinatura inválida no evento pedido.criado vindo de "principal", DESCARTADO: ...
-   ```
-
-Para comparar, suba o Estoque com `VERIFICAR_ASSINATURA=off make estoque` e
-publique a mesma mensagem: agora ela é aceita e processada (e recusada por outro
-motivo, `pedido sem itens`).
-
-### 9. Mensagem repetida não baixa nem cobra duas vezes
-
-Estoque e Pagamento guardam os pedidos já tratados e ignoram a reentrega. Com o
-Pagamento aprovando tudo (`TAXA_APROVACAO=1 make pagamento`), publique o mesmo
-pedido duas vezes:
+## Testes
 
 ```bash
-go run ./cmd/teste-publicador -pedido PED-REPETIDO -itens P001:1
-go run ./cmd/teste-publicador -pedido PED-REPETIDO -itens P001:1
+make teste                              # Go, sem precisar do broker
+make teste-mock                         # Mock de Pagamento (unittest)
+go test -race ./internal/principal/     # concorrência do Gateway (precisa de gcc)
 ```
 
-Na segunda vez, o Estoque loga `já estava reservado, reentrega ignorada` (o saldo
-de `P001` não muda) e o Pagamento loga `já foi cobrado, reentrega ignorada`.
+Os serviços recebem publicador, provedor, Estoque e notificador por interface,
+e os testes injetam versões falsas. Os bancos de teste são SQLite temporários.
+
+## Variáveis de ambiente
+
+| Variável | Padrão | Quem usa |
+|---|---|---|
+| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | todos os serviços Go |
+| `CHAVES_DIR` | `chaves` | todos os serviços Go |
+| `VERIFICAR_ASSINATURA` | ligada | consumidores; `off` aceita eventos sem validar |
+| `GATEWAY_PORTA` | `8080` | Principal |
+| `ESTOQUE_URL` | `http://localhost:8081` | Principal |
+| `FRONTEND_ORIGEM` | `http://localhost:5173,http://127.0.0.1:5173` | Principal (CORS) |
+| `ESTOQUE_PORTA` | `8081` | Estoque |
+| `ESTOQUE_BANCO` | `estoque.db` | Estoque |
+| `PAGAMENTO_PORTA` | `8082` | Pagamento |
+| `PAGAMENTO_WEBHOOK_URL` | `http://localhost:8082/webhook/pagamento` | Pagamento |
+| `MOCK_PAGAMENTO_URL` | `http://localhost:8090` | Pagamento |
+| `MOCK_PORTA` | `8090` | Mock |
+| `MOCK_URL_PUBLICA` | `http://localhost:8090` | Mock (monta a `url_checkout`) |
+| `RESEND_API_KEY` | — | Promoções; sem ela, os e-mails só vão para o log |
+| `EMAIL_REMETENTE` | `Loja SD <onboarding@resend.dev>` | Promoções |
+| `PROMOCOES_BANCO` | `promocoes.db` | Promoções |
+| `PROMOCOES_INTERVALO` | `2m` | Promoções |
 
 ## Ferramentas de desenvolvimento
 
-**`make observador`** imprime todo evento que passa pela exchange `eCommerce`
-(tipo, produtor e dados). Serve para ver o fluxo inteiro num terminal só.
+**`make observador`** imprime todo evento que passa pela exchange `eCommerce`.
 
-**`teste-publicador`** publica `pedido.criado` ou `pedido.excluido` assinado, sem
-passar pelo menu:
+**`teste-publicador`** publica `pedido.criado` ou `pedido.excluido` assinado,
+sem passar pelo Gateway:
 
 ```bash
 go run ./cmd/teste-publicador -itens P001:2,P004:1   # pedido que cabe no estoque
@@ -263,12 +315,8 @@ go run ./cmd/teste-publicador -tipo pedido.excluido -pedido PED-001 -motivo test
 | `-motivo` | `cancelado no teste` | motivo do `pedido.excluido` |
 | `-como` | `principal` | serviço cuja chave assina o evento |
 
-## Testes
-
-`make teste` roda `go test ./...`. Não precisa de broker: os serviços recebem o
-publicador por interface e os testes injetam um falso. Cobrem as regras do
-Estoque, do Pagamento, do menu e dos status do Principal, e a assinatura (evento
-alterado ou validado com a chave de outro serviço é recusado).
+Pedidos publicados assim não aparecem no frontend, porque o Gateway não os
+conhece; o resto do fluxo (Estoque, Pagamento, Mock, Entrega) funciona igual.
 
 ## Chaves
 
@@ -281,23 +329,3 @@ chaves/
 
 As chaves estão versionadas para todos usarem o mesmo conjunto. `make chaves`
 preserva as existentes; `go run ./cmd/gerar-chaves -forcar` regera tudo.
-
-C1 e C2 só consomem, então usam apenas `chaves/consumidores/publicas/`. Essa
-pasta **não** é criada pelo `gerar-chaves`: se regerar com `-forcar`, copie as
-públicas novas para lá, senão os consumidores descartam todas as promoções.
-
-```bash
-cp chaves/promocoes/publicas/*.pem chaves/consumidores/publicas/
-```
-
-## Variáveis de ambiente
-
-| Variável | Padrão | Efeito |
-|---|---|---|
-| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | endereço do broker |
-| `CHAVES_DIR` | `chaves` | pasta raiz das chaves |
-| `VERIFICAR_ASSINATURA` | ligada | `off` faz os consumidores aceitarem eventos sem validar |
-| `TAXA_APROVACAO` | `0.7` | fração de pagamentos aprovados, de 0 a 1 |
-
-Outros comandos: `make broker-parar`, `make broker-logs`, `make build` (binários
-em `bin/`) e `make limpar`.

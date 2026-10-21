@@ -2,7 +2,6 @@ package principal
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 
@@ -12,9 +11,9 @@ import (
 // Rodar com o detector de corrida:
 //
 //	go test -race ./internal/principal/
-func TestRegistroAguentaMenuEConsumidorAoMesmoTempo(t *testing.T) {
+func TestRegistroAguentaHTTPEConsumidorAoMesmoTempo(t *testing.T) {
 	registro := NovoRegistro()
-	servico := NovoServico(registro, &publicadorFalso{}, nil)
+	servico := NovoServico(registro, &estoqueFalso{}, &publicadorFalso{}, nil)
 
 	const pedidosPorGoroutine = 50
 
@@ -27,7 +26,7 @@ func TestRegistroAguentaMenuEConsumidorAoMesmoTempo(t *testing.T) {
 		go func() {
 			defer grupo.Done()
 			for j := 0; j < pedidosPorGoroutine; j++ {
-				pedido := registro.Criar("Daniel", []evento.ItemPedido{
+				pedido := registro.Criar(clienteTeste, "Daniel", []evento.ItemPedido{
 					{ProdutoID: "P001", Nome: "Notebook", Quantidade: 1, PrecoUnit: 4500},
 				})
 				ids <- pedido.ID
@@ -63,7 +62,7 @@ func TestRegistroAguentaMenuEConsumidorAoMesmoTempo(t *testing.T) {
 		go func() {
 			defer consumo.Done()
 			for j := 0; j < 200; j++ {
-				for _, pedido := range registro.Listar() {
+				for _, pedido := range registro.DoCliente(clienteTeste) {
 					_ = pedido.Status
 				}
 			}
@@ -74,35 +73,5 @@ func TestRegistroAguentaMenuEConsumidorAoMesmoTempo(t *testing.T) {
 
 	if registro.Quantidade() != pedidosPorGoroutine*2 {
 		t.Fatalf("esperava %d pedidos, vieram %d", pedidosPorGoroutine*2, registro.Quantidade())
-	}
-}
-
-func TestMenuEAvisoNaoSeAtropelamNaTela(t *testing.T) {
-	registro := NovoRegistro()
-	var tela strings.Builder
-
-	menu := NovoMenu(registro, &publicadorFalso{}, strings.NewReader("Daniel\n1\n1\n1\n0\n"), &tela)
-
-	var avisos sync.WaitGroup
-	avisos.Add(1)
-	pronto := make(chan struct{})
-
-	go func() {
-		defer avisos.Done()
-		for i := 0; i < 300; i++ {
-			menu.Avisar("PED-abc123 → pagamento aprovado")
-		}
-		close(pronto)
-	}()
-
-	if err := menu.Rodar(context.Background()); err != nil {
-		t.Fatalf("rodando o menu: %v", err)
-	}
-
-	<-pronto
-	avisos.Wait()
-
-	if !strings.Contains(tela.String(), "pagamento aprovado") {
-		t.Fatal("os avisos não chegaram na tela")
 	}
 }

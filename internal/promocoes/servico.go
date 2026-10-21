@@ -1,104 +1,231 @@
+// Package promocoes implementa o microsserviço de promoções.
+//
+// Consome interesse.promocao e interesse.cancelado para manter, no SQLite, os
+// e-mails inscritos em cada categoria. A cada intervalo gera uma promoção de
+// um produto das categorias que têm inscritos, publica promocao.criada para o
+// Estoque passar a cobrar o preço promocional e envia um e-mail a cada
+// inscrito da categoria pela API de e-mail.
 package promocoes
 
 import (
 	"context"
-	"ecommerce/internal/evento"
+	"errors"
 	"fmt"
+	"html"
+	"log"
+	"math"
 	"math/rand/v2"
+	"strconv"
+	"strings"
 	"time"
+
+	"ecommerce/internal/catalogo"
+	"ecommerce/internal/evento"
 )
 
+// Publicador é o pedaço da mensageria que o Promoções usa.
+type Publicador interface {
+	PublicarECommerce(ctx context.Context, routingKey string, dados any) error
+}
+
 const (
-	TEMPO_PROMOCOES_MIN_MS      = 3000
-	TEMPO_PROMOCOES_MAX_MS      = 8000
 	DESCONTO_MIN                = 5
 	DESCONTO_MAX                = 45
 	DESCONTO_VALIDADE_MAX_HORAS = 10
 )
 
-type publicador interface {
-	PublicarPromocao(ctx context.Context, categoria string, dados any) error
+// Notificador envia um e-mail.
+type Notificador interface {
+	Enviar(ctx context.Context, para, assunto, corpoHTML string) error
 }
 
-type Produto struct {
-	ID, Nome, Categoria string
-	Preco               float32
+// Promocao é um desconto temporário num produto.
+type Promocao struct {
+	ProdutoID string
+	Nome      string
+	Categoria string
+	PrecoDe   float64
+	PrecoPor  float64
+	Desconto  int
+	ValidaAte time.Time
 }
 
-var produtos = []Produto{
-	{ID: "P001", Nome: "Notebook Gamer 16GB", Categoria: "A", Preco: 4500.00},
-	{ID: "P002", Nome: "Mouse sem fio", Categoria: "A", Preco: 150.00},
-	{ID: "P003", Nome: "Teclado mecânico", Categoria: "A", Preco: 320.00},
-	{ID: "P004", Nome: "Cafeteira expresso", Categoria: "B", Preco: 280.00},
-	{ID: "P005", Nome: "Liquidificador 900W", Categoria: "B", Preco: 190.00},
-	{ID: "P006", Nome: "Air Fryer 5L", Categoria: "B", Preco: 450.00},
-	{ID: "P007", Nome: "Camiseta algodão", Categoria: "C", Preco: 79.90},
-	{ID: "P008", Nome: "Tênis de corrida", Categoria: "C", Preco: 350.00},
-	{ID: "P009", Nome: "Mochila 30L", Categoria: "C", Preco: 210.00},
-}
-
-var Categorias = []string{"A", "B", "C"}
-
+// Servico guarda as inscrições e dispara as promoções.
 type Servico struct {
-	publicador publicador
+	repositorio *Repositorio
+	notificador Notificador
+	publicador  Publicador
+	intervalo   time.Duration
 }
 
-func NovoServico(publicador publicador) *Servico {
-	return &Servico{publicador}
+// NovoServico monta o serviço, que gera uma promoção a cada intervalo.
+func NovoServico(repositorio *Repositorio, notificador Notificador, publicador Publicador, intervalo time.Duration) *Servico {
+	return &Servico{repositorio: repositorio, notificador: notificador, publicador: publicador, intervalo: intervalo}
 }
 
+// Tratar é o ponto de entrada do consumidor: despacha pela routing key.
+func (s *Servico) Tratar(ctx context.Context, env evento.Envelope) error {
+	switch env.Tipo {
+	case evento.InteressePromocao:
+		return s.aoInteresse(ctx, env)
+	case evento.InteresseCancelado:
+		return s.aoCancelamento(ctx, env)
+	default:
+		log.Printf("evento %s ignorado: não é assunto do Promoções", env.Tipo)
+		return nil
+	}
+}
+
+func (s *Servico) aoInteresse(ctx context.Context, env evento.Envelope) error {
+	var dados evento.DadosInteressePromocao
+	if err := env.DecodificarDados(&dados); err != nil {
+		return err
+	}
+	if dados.Email == "" || len(dados.Categorias) == 0 {
+		return fmt.Errorf("interesse sem e-mail ou sem categorias: %+v", dados)
+	}
+
+	if err := s.repositorio.Inscrever(ctx, dados.Email, dados.Categorias); err != nil {
+		return err
+	}
+	log.Printf("%s inscrito nas categorias %v", dados.Email, dados.Categorias)
+	return nil
+}
+
+func (s *Servico) aoCancelamento(ctx context.Context, env evento.Envelope) error {
+	var dados evento.DadosInteresseCancelado
+	if err := env.DecodificarDados(&dados); err != nil {
+		return err
+	}
+
+	removidas, err := s.repositorio.Cancelar(ctx, dados.Email)
+	switch {
+	case err != nil:
+		return err
+	case removidas == 0:
+		log.Printf("cancelamento de %s ignorado: não estava inscrito", dados.Email)
+	default:
+		log.Printf("inscrição de %s cancelada (%d categoria(s))", dados.Email, removidas)
+	}
+	return nil
+}
+
+// EnviarPromocoes gera uma promoção a cada intervalo, até o contexto acabar.
+// Uma rodada que falha é registrada no log e não interrompe as próximas.
 func (s *Servico) EnviarPromocoes(ctx context.Context) error {
-	timer := time.NewTimer(s.obterDuracaoAleatoriaEmMs(TEMPO_PROMOCOES_MIN_MS, TEMPO_PROMOCOES_MAX_MS))
-
-	defer timer.Stop()
+	log.Printf("gerando uma promoção a cada %s", s.intervalo)
+	relogio := time.NewTicker(s.intervalo)
+	defer relogio.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Encerrando serviço...")
 			return nil
-		case <-timer.C:
-			if err := s.enviar(ctx); err != nil {
-				return fmt.Errorf("Falha ao enviar promocoes. %w", err)
+		case <-relogio.C:
+			if err := s.Promover(ctx); err != nil {
+				log.Printf("rodada de promoção com falha: %v", err)
 			}
-
-			timer.Reset(s.obterDuracaoAleatoriaEmMs(TEMPO_PROMOCOES_MIN_MS, TEMPO_PROMOCOES_MAX_MS))
 		}
 	}
 }
 
-func (s *Servico) enviar(ctx context.Context) error {
-	produtoPromocao := produtos[rand.IntN(len(produtos))]
-	descontoPorcentagem := s.gerarDesconto(DESCONTO_MIN, DESCONTO_MAX)
-	validadeDesconto := s.gerarValidadeDescontoUTC()
-	valorDesconto := produtoPromocao.Preco * float32(100-descontoPorcentagem) / 100
-
-	dadosPromocao := evento.DadosPromocao{
-		ProdutoID: produtoPromocao.ID,
-		Nome:      produtoPromocao.Nome,
-		Categoria: produtoPromocao.Categoria,
-		PrecoDe:   produtoPromocao.Preco,
-		PrecoPor:  valorDesconto,
-		Desconto:  descontoPorcentagem,
-		ValidaAte: validadeDesconto,
+// Promover gera uma promoção de um produto das categorias com inscritos,
+// publica promocao.criada e envia um e-mail a cada inscrito da categoria. Sem
+// inscritos, não gera nada. Se a publicação falhar, nenhum e-mail sai, para a
+// loja não anunciar um preço que não vai cobrar. A falha no envio para um
+// e-mail não impede o envio para os demais.
+func (s *Servico) Promover(ctx context.Context) error {
+	categorias, err := s.repositorio.CategoriasComInscritos(ctx)
+	if err != nil {
+		return err
 	}
 
-	if err := s.publicador.PublicarPromocao(ctx, dadosPromocao.Categoria, dadosPromocao); err != nil {
-		return fmt.Errorf("Falhar ao publicar mensagem no broker. %w", err)
+	promocao, gerada := gerarPromocao(categorias, time.Now())
+	if !gerada {
+		log.Printf("nenhum e-mail inscrito em categorias com produtos: nenhuma promoção gerada")
+		return nil
 	}
 
-	return nil
+	err = s.publicador.PublicarECommerce(ctx, evento.PromocaoCriada, evento.DadosPromocaoCriada{
+		ProdutoID:        promocao.ProdutoID,
+		PrecoPromocional: promocao.PrecoPor,
+		Desconto:         promocao.Desconto,
+		ValidaAte:        promocao.ValidaAte,
+	})
+	if err != nil {
+		return fmt.Errorf("publicando a promoção de %s (nenhum e-mail enviado): %w", promocao.Nome, err)
+	}
+
+	inscritos, err := s.repositorio.Inscritos(ctx, promocao.Categoria)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("promoção: %s (categoria %s) de %s por %s, para %d inscrito(s)",
+		promocao.Nome, promocao.Categoria, moeda(promocao.PrecoDe), moeda(promocao.PrecoPor), len(inscritos))
+
+	assunto, corpo := montarEmail(promocao)
+	var falhas []error
+	for _, email := range inscritos {
+		if err := s.notificador.Enviar(ctx, email, assunto, corpo); err != nil {
+			falhas = append(falhas, fmt.Errorf("%s: %w", email, err))
+			continue
+		}
+		log.Printf("e-mail da promoção enviado para %s", email)
+	}
+	return errors.Join(falhas...)
 }
 
-func (s *Servico) obterDuracaoAleatoriaEmMs(min int, max int) time.Duration {
-	return time.Duration((min + rand.IntN(max-min))) * time.Millisecond
+// gerarPromocao sorteia um produto das categorias informadas e um desconto,
+// com o preço promocional arredondado para centavos. O segundo retorno é falso
+// quando nenhuma das categorias tem produto.
+func gerarPromocao(categorias []string, agora time.Time) (Promocao, bool) {
+	var candidatos []catalogo.Produto
+	for _, categoria := range categorias {
+		candidatos = append(candidatos, catalogo.PorCategoria(categoria)...)
+	}
+	if len(candidatos) == 0 {
+		return Promocao{}, false
+	}
+
+	produto := candidatos[rand.IntN(len(candidatos))]
+	desconto := DESCONTO_MIN + rand.IntN(DESCONTO_MAX-DESCONTO_MIN)
+	validade := time.Duration(1+rand.IntN(DESCONTO_VALIDADE_MAX_HORAS-1)) * time.Hour
+
+	return Promocao{
+		ProdutoID: produto.ID,
+		Nome:      produto.Nome,
+		Categoria: produto.Categoria,
+		PrecoDe:   produto.Preco,
+		PrecoPor:  math.Round(produto.Preco*float64(100-desconto)) / 100,
+		Desconto:  desconto,
+		ValidaAte: agora.Add(validade),
+	}, true
 }
 
-func (s *Servico) gerarDesconto(min int, max int) int {
-	return (min + rand.IntN(max-min))
+// montarEmail devolve o assunto e o corpo HTML do e-mail da promoção.
+func montarEmail(p Promocao) (string, string) {
+	assunto := fmt.Sprintf("Promoção: %s com %d%% de desconto", p.Nome, p.Desconto)
+	corpo := fmt.Sprintf(`<h2>%s</h2>
+<p>De <s>%s</s> por <strong>%s</strong> (%d%% de desconto).</p>
+<p>Válida até %s.</p>
+<p style="color:#6b7785;font-size:12px">Você recebe este e-mail porque se inscreveu nas promoções da categoria %s.</p>`,
+		html.EscapeString(p.Nome), moeda(p.PrecoDe), moeda(p.PrecoPor), p.Desconto,
+		p.ValidaAte.Format("02/01/2006 15:04"), p.Categoria)
+	return assunto, corpo
 }
 
-func (s *Servico) gerarValidadeDescontoUTC() string {
-	duracaoDescontoHoras := time.Duration((1 + rand.IntN(DESCONTO_VALIDADE_MAX_HORAS-1))) * time.Hour
-	return time.Now().Add(duracaoDescontoHoras).UTC().Format(time.RFC3339)
+// moeda formata no padrão brasileiro: R$ 4.500,00.
+func moeda(valor float64) string {
+	texto := strconv.FormatFloat(valor, 'f', 2, 64)
+	inteiro, centavos, _ := strings.Cut(texto, ".")
+
+	var grupos []string
+	for len(inteiro) > 3 {
+		grupos = append([]string{inteiro[len(inteiro)-3:]}, grupos...)
+		inteiro = inteiro[:len(inteiro)-3]
+	}
+	grupos = append([]string{inteiro}, grupos...)
+
+	return "R$ " + strings.Join(grupos, ".") + "," + centavos
 }

@@ -57,9 +57,13 @@ func executar(ctx context.Context) error {
 		evento.PedidoExcluido,
 		evento.PedidoEstoqueOK,
 		evento.EstoqueIndisponivel,
+		evento.PagamentoPendente,
 		evento.PagamentoAprovado,
 		evento.PagamentoRecusado,
 		evento.PedidoEnviado,
+		evento.InteressePromocao,
+		evento.InteresseCancelado,
+		evento.PromocaoCriada,
 	)
 	if err != nil {
 		return err

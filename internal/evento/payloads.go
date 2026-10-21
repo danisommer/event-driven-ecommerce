@@ -1,5 +1,7 @@
 package evento
 
+import "time"
+
 // ItemPedido é um produto e a quantidade solicitada dentro de um pedido.
 type ItemPedido struct {
 	ProdutoID  string  `json:"produto_id"`
@@ -43,6 +45,16 @@ type DadosEstoqueIndisponivel struct {
 	Motivo     string `json:"motivo"`
 }
 
+// DadosPagamentoPendente acompanha a routing key pagamento.pendente.
+// Publicado pelo Pagamento, consumido pelo Principal. Leva a URL de checkout
+// do provedor de pagamento, que o Principal repassa ao frontend.
+type DadosPagamentoPendente struct {
+	PedidoID    string  `json:"pedido_id"`
+	CobrancaID  string  `json:"cobranca_id"`
+	URLCheckout string  `json:"url_checkout"`
+	Valor       float64 `json:"valor"`
+}
+
 // DadosPagamentoAprovado acompanha a routing key pagamento.aprovado.
 // Publicado pelo Pagamento, consumido pela Entrega e pelo Principal.
 // Leva os itens junto porque a Entrega precisa deles para emitir a nota.
@@ -70,14 +82,26 @@ type DadosPedidoEnviado struct {
 	CodigoRastreio string `json:"codigo_rastreio"`
 }
 
-// DadosPromocao acompanha as routing keys promocao.categoria.<X> na exchange
-// topic. Publicado pelo Promoções, consumido por C1 e C2.
-type DadosPromocao struct {
-	ProdutoID string  `json:"produto_id"`
-	Nome      string  `json:"nome"`
-	Categoria string  `json:"categoria"`
-	PrecoDe   float32 `json:"preco_de"`
-	PrecoPor  float32 `json:"preco_por"`
-	Desconto  int     `json:"desconto_percentual"`
-	ValidaAte string  `json:"valida_ate"`
+// DadosInteressePromocao acompanha a routing key interesse.promocao.
+// Publicado pelo Principal, consumido pelo Promoções. Substitui as categorias
+// de interesse já cadastradas para o e-mail.
+type DadosInteressePromocao struct {
+	Email      string   `json:"email"`
+	Categorias []string `json:"categorias"`
+}
+
+// DadosInteresseCancelado acompanha a routing key interesse.cancelado.
+// Publicado pelo Principal, consumido pelo Promoções.
+type DadosInteresseCancelado struct {
+	Email string `json:"email"`
+}
+
+// DadosPromocaoCriada acompanha a routing key promocao.criada.
+// Publicado pelo Promoções, consumido pelo Estoque, que passa a vender o
+// produto pelo preço promocional até a validade.
+type DadosPromocaoCriada struct {
+	ProdutoID        string    `json:"produto_id"`
+	PrecoPromocional float64   `json:"preco_promocional"`
+	Desconto         int       `json:"desconto_percentual"`
+	ValidaAte        time.Time `json:"valida_ate"`
 }

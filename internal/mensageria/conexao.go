@@ -70,7 +70,6 @@ func (c *Conexao) DeclararExchanges() error {
 		tipo string
 	}{
 		{evento.ExchangeECommerce, amqp.ExchangeDirect},
-		{evento.ExchangePromocoes, amqp.ExchangeTopic},
 	}
 
 	for _, e := range exchanges {

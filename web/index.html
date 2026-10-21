@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loja SD</title>
+  <link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+  <header class="topo">
+    <span class="marca">Loja SD</span>
+    <nav class="navegacao">
+      <a href="#catalogo">Catálogo</a>
+      <a href="#pedidos">Meus pedidos</a>
+      <a href="#promocoes">Promoções</a>
+    </nav>
+    <span id="conexao" class="conexao" data-estado="conectando">
+      <span class="ponto" aria-hidden="true"></span>
+      <span id="conexao-texto">Conectando…</span>
+    </span>
+  </header>
+
+  <main class="layout">
+    <section id="catalogo" class="painel">
+      <div class="painel-topo">
+        <h2>Catálogo</h2>
+        <div id="filtros" class="filtros" role="group" aria-label="Filtrar por categoria"></div>
+      </div>
+      <div id="produtos" class="grade">
+        <p class="vazio">Carregando produtos…</p>
+      </div>
+    </section>
+
+    <aside class="painel carrinho" aria-labelledby="titulo-carrinho">
+      <h2 id="titulo-carrinho">Carrinho</h2>
+      <ul id="itens-carrinho" class="itens-carrinho"></ul>
+      <div class="total">
+        <span>Total estimado</span>
+        <strong id="total-carrinho">R$ 0,00</strong>
+      </div>
+      <label class="campo">
+        Seu nome
+        <input id="nome-cliente" autocomplete="name" placeholder="Como devemos te chamar?">
+      </label>
+      <button id="finalizar" type="button" class="botao primario" disabled>Finalizar pedido</button>
+      <p class="dica">Ao finalizar, uma nova aba abre com a página de pagamento.</p>
+    </aside>
+
+    <section id="pedidos" class="painel largo">
+      <h2>Meus pedidos</h2>
+      <div id="lista-pedidos" class="lista-pedidos"></div>
+    </section>
+
+    <section id="promocoes" class="painel largo">
+      <h2>Promoções por e-mail</h2>
+      <p class="dica">Escolha as categorias e receba as ofertas no seu e-mail.</p>
+      <form id="form-promocoes" class="form-promocoes" novalidate>
+        <label class="campo">
+          E-mail
+          <input id="email" type="email" required autocomplete="email" placeholder="voce@exemplo.com">
+        </label>
+        <fieldset id="categorias" class="categorias">
+          <legend>Categorias</legend>
+        </fieldset>
+        <div class="acoes">
+          <button type="submit" class="botao primario">Quero receber</button>
+          <button id="cancelar-inscricao" type="button" class="botao">Cancelar inscrição</button>
+        </div>
+        <p id="mensagem-promocoes" class="mensagem" role="status"></p>
+      </form>
+    </section>
+  </main>
+
+  <footer class="rodape">
+    Seu identificador de cliente é <code id="cliente-id"></code>. Ele fica salvo neste navegador e liga você aos seus pedidos.
+  </footer>
+
+  <div id="avisos" class="avisos" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

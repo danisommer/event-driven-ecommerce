@@ -10,12 +10,9 @@ import (
 	"time"
 )
 
-// Nomes das exchanges declaradas no RabbitMQ: eCommerce é do tipo direct e
-// promocoes é do tipo topic.
-const (
-	ExchangeECommerce = "eCommerce"
-	ExchangePromocoes = "promocoes"
-)
+// ExchangeECommerce é a exchange do tipo direct por onde passam todos os
+// eventos do sistema.
+const ExchangeECommerce = "eCommerce"
 
 // Routing keys da exchange eCommerce.
 const (
@@ -23,29 +20,23 @@ const (
 	PedidoExcluido      = "pedido.excluido"
 	PedidoEstoqueOK     = "pedido.estoque_ok"
 	EstoqueIndisponivel = "estoque.indisponivel"
+	PagamentoPendente   = "pagamento.pendente"
 	PagamentoAprovado   = "pagamento.aprovado"
 	PagamentoRecusado   = "pagamento.recusado"
 	PedidoEnviado       = "pedido.enviado"
+	InteressePromocao   = "interesse.promocao"
+	InteresseCancelado  = "interesse.cancelado"
+	PromocaoCriada      = "promocao.criada"
 )
-
-// PrefixoPromocao antecede a categoria nas routing keys da exchange
-// promocoes. A chave completa fica "promocao.categoria.A", por exemplo.
-const PrefixoPromocao = "promocao.categoria."
-
-// ChavePromocao monta a routing key de promoção de uma categoria.
-func ChavePromocao(categoria string) string {
-	return PrefixoPromocao + categoria
-}
 
 // Nomes dos microsserviços. O nome identifica o produtor do evento e também a
 // pasta de chaves usada por ele, em chaves/<nome>.
 const (
-	ServicoPrincipal    = "principal"
-	ServicoEstoque      = "estoque"
-	ServicoPagamento    = "pagamento"
-	ServicoEntrega      = "entrega"
-	ServicoPromocoes    = "promocoes"
-	ServicoConsumidores = "consumidores"
+	ServicoPrincipal = "principal"
+	ServicoEstoque   = "estoque"
+	ServicoPagamento = "pagamento"
+	ServicoEntrega   = "entrega"
+	ServicoPromocoes = "promocoes"
 )
 
 // Servicos lista todos os microsserviços que assinam eventos. É usada para

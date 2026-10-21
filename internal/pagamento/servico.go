@@ -1,20 +1,16 @@
-// Package pagamento implementa o microsserviço de processamento de
-// pagamentos.
+// Package pagamento implementa o microsserviço de pagamentos.
 //
-// Consome pedido.estoque_ok; publica pagamento.aprovado ou
-// pagamento.recusado.
+// Consome pedido.estoque_ok e pedido.excluido. Para cada pedido com estoque
+// confirmado, cria uma cobrança no provedor externo (o Mock de Pagamento) e
+// publica pagamento.pendente com a URL de checkout. Quando o provedor avisa o
+// resultado pelo webhook, publica pagamento.aprovado ou pagamento.recusado.
 package pagamento
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"log"
-	mrand "math/rand"
-	"os"
-	"strconv"
 	"sync"
-	"time"
 
 	"ecommerce/internal/evento"
 )
@@ -24,144 +20,215 @@ type Publicador interface {
 	PublicarECommerce(ctx context.Context, routingKey string, dados any) error
 }
 
-// taxaAprovacaoPadrao é a fração de pagamentos aprovados na simulação.
-const taxaAprovacaoPadrao = 0.7
-
-// Tempo simulado de conversa com a operadora de cartão.
-const (
-	atrasoMinimoPadrao = 400 * time.Millisecond
-	atrasoMaximoPadrao = 1500 * time.Millisecond
-)
-
-// motivosRecusa são as justificativas sorteadas quando o pagamento cai.
-var motivosRecusa = []string{
-	"saldo insuficiente",
-	"cartão expirado",
-	"transação negada pelo emissor",
-	"suspeita de fraude",
-	"limite diário excedido",
+// Provedor é o provedor de pagamentos externo.
+type Provedor interface {
+	CriarCobranca(ctx context.Context, pedidoID string, valor float64) (CobrancaCriada, error)
 }
 
-// Servico processa os pagamentos dos pedidos que passaram pelo estoque.
+// Decisões que o provedor envia pelo webhook.
+const (
+	DecisaoAprovado = "APROVADO"
+	DecisaoRecusado = "RECUSADO"
+)
+
+// Erros de Decidir, que a API traduz em status HTTP.
+var (
+	ErrDecisaoInvalida      = errors.New("status deve ser APROVADO ou RECUSADO")
+	ErrCobrancaDesconhecida = errors.New("cobrança desconhecida")
+	ErrPedidoDivergente     = errors.New("a cobrança não pertence a este pedido")
+)
+
+const (
+	motivoSemCobranca = "não foi possível criar a cobrança no provedor de pagamento"
+	motivoRecusado    = "recusado no provedor de pagamento"
+)
+
+type situacao string
+
+const (
+	pendente  situacao = "pendente"
+	aprovada  situacao = "aprovada"
+	recusada  situacao = "recusada"
+	cancelada situacao = "cancelada"
+)
+
+// cobranca é o que o Pagamento sabe de um pedido. id fica vazio quando o
+// provedor não chegou a criar a cobrança.
+type cobranca struct {
+	id       string
+	pedido   evento.DadosPedidoEstoqueOK
+	situacao situacao
+}
+
+// Servico guarda, em memória, a cobrança de cada pedido e reage aos eventos e
+// ao webhook do provedor. O mutex protege os mapas, que são lidos pelo
+// consumidor e pelas requisições HTTP ao mesmo tempo.
 type Servico struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	porPedido map[string]*cobranca
+	porID     map[string]*cobranca
 
-	processados   map[string]string
-	taxaAprovacao float64
-	atrasoMinimo  time.Duration
-	atrasoMaximo  time.Duration
-
+	provedor   Provedor
 	publicador Publicador
 }
 
-// NovoServico monta o serviço. A taxa de aprovação pode ser ajustada pela
-// variável de ambiente TAXA_APROVACAO, entre 0 e 1.
-func NovoServico(publicador Publicador) *Servico {
-	taxa := taxaAprovacaoPadrao
-	if bruto := os.Getenv("TAXA_APROVACAO"); bruto != "" {
-		if valor, err := strconv.ParseFloat(bruto, 64); err == nil && valor >= 0 && valor <= 1 {
-			taxa = valor
-		} else {
-			log.Printf("TAXA_APROVACAO=%q inválida, usando %.2f", bruto, taxa)
-		}
-	}
-
-	log.Printf("simulação de pagamento com %.0f%% de aprovação", taxa*100)
-
+// NovoServico liga o serviço ao provedor externo e ao broker.
+func NovoServico(provedor Provedor, publicador Publicador) *Servico {
 	return &Servico{
-		processados:   make(map[string]string),
-		taxaAprovacao: taxa,
-		atrasoMinimo:  atrasoMinimoPadrao,
-		atrasoMaximo:  atrasoMaximoPadrao,
-		publicador:    publicador,
+		porPedido:  make(map[string]*cobranca),
+		porID:      make(map[string]*cobranca),
+		provedor:   provedor,
+		publicador: publicador,
 	}
 }
 
-// Tratar é o ponto de entrada do consumidor.
+// Tratar é o ponto de entrada do consumidor: despacha pela routing key.
 func (s *Servico) Tratar(ctx context.Context, env evento.Envelope) error {
-	if env.Tipo != evento.PedidoEstoqueOK {
+	switch env.Tipo {
+	case evento.PedidoEstoqueOK:
+		return s.aoEstoqueOK(ctx, env)
+	case evento.PedidoExcluido:
+		return s.aoPedidoExcluido(env)
+	default:
 		log.Printf("evento %s ignorado: não é assunto do Pagamento", env.Tipo)
 		return nil
 	}
+}
 
+// aoEstoqueOK cria a cobrança no provedor e publica pagamento.pendente com a
+// URL de checkout. Sem conseguir criar a cobrança, publica pagamento.recusado.
+func (s *Servico) aoEstoqueOK(ctx context.Context, env evento.Envelope) error {
 	var pedido evento.DadosPedidoEstoqueOK
 	if err := env.DecodificarDados(&pedido); err != nil {
 		return err
 	}
 
-	if s.jaProcessado(pedido.PedidoID) {
-		log.Printf("pedido %s já foi cobrado, reentrega ignorada", pedido.PedidoID)
+	if anterior, existe := s.situacaoDo(pedido.PedidoID); existe {
+		log.Printf("pedido %s já passou pelo Pagamento (%s), reentrega ignorada", pedido.PedidoID, anterior)
 		return nil
 	}
 
-	log.Printf("processando pagamento do pedido %s no valor de R$ %.2f", pedido.PedidoID, pedido.Total)
-	s.simularComunicacaoComOperadora(ctx)
-
-	if mrand.Float64() < s.taxaAprovacao {
-		return s.aprovar(ctx, pedido)
+	criada, err := s.provedor.CriarCobranca(ctx, pedido.PedidoID, pedido.Total)
+	if err != nil {
+		log.Printf("✗ pedido %s sem cobrança: %v", pedido.PedidoID, err)
+		s.guardar(&cobranca{pedido: pedido, situacao: recusada})
+		return s.publicador.PublicarECommerce(ctx, evento.PagamentoRecusado, evento.DadosPagamentoRecusado{
+			PedidoID: pedido.PedidoID,
+			Valor:    pedido.Total,
+			Motivo:   motivoSemCobranca,
+		})
 	}
-	return s.recusar(ctx, pedido)
-}
 
-func (s *Servico) aprovar(ctx context.Context, pedido evento.DadosPedidoEstoqueOK) error {
-	transacao := "TX-" + identificador()
-	s.registrar(pedido.PedidoID, transacao)
+	s.guardar(&cobranca{id: criada.ID, pedido: pedido, situacao: pendente})
+	log.Printf("pedido %s: cobrança %s criada, aguardando o comprador em %s", pedido.PedidoID, criada.ID, criada.URLCheckout)
 
-	log.Printf("✓ pagamento do pedido %s APROVADO (transação %s)", pedido.PedidoID, transacao)
-
-	return s.publicador.PublicarECommerce(ctx, evento.PagamentoAprovado, evento.DadosPagamentoAprovado{
+	return s.publicador.PublicarECommerce(ctx, evento.PagamentoPendente, evento.DadosPagamentoPendente{
 		PedidoID:    pedido.PedidoID,
-		TransacaoID: transacao,
+		CobrancaID:  criada.ID,
+		URLCheckout: criada.URLCheckout,
 		Valor:       pedido.Total,
-		Itens:       pedido.Itens,
 	})
 }
 
-func (s *Servico) recusar(ctx context.Context, pedido evento.DadosPedidoEstoqueOK) error {
-	motivo := motivosRecusa[mrand.Intn(len(motivosRecusa))]
-	s.registrar(pedido.PedidoID, "recusado: "+motivo)
-
-	log.Printf("✗ pagamento do pedido %s RECUSADO (%s)", pedido.PedidoID, motivo)
-
-	return s.publicador.PublicarECommerce(ctx, evento.PagamentoRecusado, evento.DadosPagamentoRecusado{
-		PedidoID: pedido.PedidoID,
-		Valor:    pedido.Total,
-		Motivo:   motivo,
-	})
-}
-
-// simularComunicacaoComOperadora segura o processamento por um tempo
-// aleatório entre atrasoMinimo e atrasoMaximo.
-func (s *Servico) simularComunicacaoComOperadora(ctx context.Context) {
-	faixa := s.atrasoMaximo - s.atrasoMinimo
-	if faixa <= 0 {
-		return
+// aoPedidoExcluido cancela a cobrança pendente do pedido, para que uma decisão
+// que chegue depois pelo webhook seja ignorada. Se o pedido ainda não passou
+// pelo Pagamento, registra o cancelamento para a cobrança nem ser criada.
+func (s *Servico) aoPedidoExcluido(env evento.Envelope) error {
+	var excluido evento.DadosPedidoExcluido
+	if err := env.DecodificarDados(&excluido); err != nil {
+		return err
 	}
 
-	espera := s.atrasoMinimo + time.Duration(mrand.Int63n(int64(faixa)))
-	select {
-	case <-time.After(espera):
-	case <-ctx.Done():
-	}
-}
-
-func (s *Servico) jaProcessado(pedidoID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, existe := s.processados[pedidoID]
-	return existe
+
+	c, existe := s.porPedido[excluido.PedidoID]
+	switch {
+	case !existe:
+		s.porPedido[excluido.PedidoID] = &cobranca{
+			pedido:   evento.DadosPedidoEstoqueOK{PedidoID: excluido.PedidoID},
+			situacao: cancelada,
+		}
+		log.Printf("pedido %s excluído (%s) antes de chegar ao Pagamento: nenhuma cobrança será criada",
+			excluido.PedidoID, excluido.Motivo)
+	case c.situacao == pendente:
+		c.situacao = cancelada
+		log.Printf("pedido %s excluído (%s): cobrança %s cancelada", excluido.PedidoID, excluido.Motivo, c.id)
+	default:
+		log.Printf("pedido %s excluído (%s): o pagamento já estava %s, nada a fazer",
+			excluido.PedidoID, excluido.Motivo, c.situacao)
+	}
+	return nil
 }
 
-func (s *Servico) registrar(pedidoID, resultado string) {
+// Decidir aplica a decisão do provedor sobre uma cobrança e publica
+// pagamento.aprovado ou pagamento.recusado. Decisão repetida ou sobre
+// cobrança cancelada é ignorada sem erro, para o provedor não reenviar. Se a
+// publicação falhar, a cobrança continua pendente e aceita nova tentativa.
+func (s *Servico) Decidir(ctx context.Context, cobrancaID, pedidoID, decisao string) error {
+	if decisao != DecisaoAprovado && decisao != DecisaoRecusado {
+		return ErrDecisaoInvalida
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.processados[pedidoID] = resultado
+
+	c, existe := s.porID[cobrancaID]
+	switch {
+	case !existe:
+		return ErrCobrancaDesconhecida
+	case c.pedido.PedidoID != pedidoID:
+		return ErrPedidoDivergente
+	case c.situacao != pendente:
+		log.Printf("cobrança %s já está %s: aviso %s ignorado", cobrancaID, c.situacao, decisao)
+		return nil
+	}
+
+	nova, err := s.publicarDecisao(ctx, c, decisao)
+	if err != nil {
+		return err
+	}
+	c.situacao = nova
+	return nil
 }
 
-func identificador() string {
-	b := make([]byte, 6)
-	if _, err := rand.Read(b); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16)
+func (s *Servico) publicarDecisao(ctx context.Context, c *cobranca, decisao string) (situacao, error) {
+	switch decisao {
+	case DecisaoAprovado:
+		log.Printf("✓ pagamento do pedido %s APROVADO (cobrança %s)", c.pedido.PedidoID, c.id)
+		return aprovada, s.publicador.PublicarECommerce(ctx, evento.PagamentoAprovado, evento.DadosPagamentoAprovado{
+			PedidoID:    c.pedido.PedidoID,
+			TransacaoID: c.id,
+			Valor:       c.pedido.Total,
+			Itens:       c.pedido.Itens,
+		})
+	default:
+		log.Printf("✗ pagamento do pedido %s RECUSADO (cobrança %s)", c.pedido.PedidoID, c.id)
+		return recusada, s.publicador.PublicarECommerce(ctx, evento.PagamentoRecusado, evento.DadosPagamentoRecusado{
+			PedidoID: c.pedido.PedidoID,
+			Valor:    c.pedido.Total,
+			Motivo:   motivoRecusado,
+		})
 	}
-	return hex.EncodeToString(b)
+}
+
+func (s *Servico) situacaoDo(pedidoID string) (situacao, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, existe := s.porPedido[pedidoID]
+	if !existe {
+		return "", false
+	}
+	return c.situacao, true
+}
+
+func (s *Servico) guardar(c *cobranca) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.porPedido[c.pedido.PedidoID] = c
+	if c.id != "" {
+		s.porID[c.id] = c
+	}
 }

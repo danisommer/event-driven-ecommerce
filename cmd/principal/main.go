@@ -1,54 +1,55 @@
-// Comando principal sobe o microsserviço Principal, a interface de terminal
-// do sistema.
+// Comando principal sobe o microsserviço Principal, o API Gateway da loja.
 //
 //	go run ./cmd/principal
 //
-// Publica pedido.criado e pedido.excluido na exchange eCommerce. Consome
-// pedido.estoque_ok, estoque.indisponivel, pagamento.aprovado,
-// pagamento.recusado e pedido.enviado, atualizando o status dos pedidos.
+// Atende a API REST e o SSE do frontend na porta GATEWAY_PORTA, consulta os
+// produtos no MS Estoque (ESTOQUE_URL) e conversa com o resto do sistema pela
+// exchange eCommerce: publica pedido.criado, pedido.excluido,
+// interesse.promocao e interesse.cancelado, e consome os eventos de status
+// dos pedidos.
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"ecommerce/internal/cripto"
 	"ecommerce/internal/evento"
 	"ecommerce/internal/mensageria"
 	"ecommerce/internal/principal"
+	"ecommerce/internal/rest"
 )
 
-// arquivoDeLog recebe o log da camada de mensageria.
-const arquivoDeLog = "principal.log"
+const (
+	portaPadrao      = "8080"
+	urlEstoquePadrao = "http://localhost:8081"
+	origensPadrao    = "http://localhost:5173,http://127.0.0.1:5173"
+)
 
 func main() {
+	log.SetPrefix("[principal] ")
+	log.SetFlags(log.Ltime)
+
 	ctx, parar := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer parar()
 
 	if err := executar(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "\nerro: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("erro: %v", err)
 	}
+	log.Println("encerrado")
 }
 
 func executar(ctx context.Context) error {
-	destinoLog, err := os.OpenFile(arquivoDeLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("abrindo %s: %w", arquivoDeLog, err)
-	}
-	defer destinoLog.Close()
-	mensageria.DefinirLog(log.New(destinoLog, "", log.LstdFlags))
-
 	chaveiro, err := cripto.CarregarChaveiro(mensageria.DiretorioChaves(), evento.ServicoPrincipal)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("conectando no broker...")
 	conexao, err := mensageria.Conectar(mensageria.URLBroker())
 	if err != nil {
 		return err
@@ -60,9 +61,9 @@ func executar(ctx context.Context) error {
 	}
 
 	publicador := mensageria.NovoPublicador(conexao, chaveiro)
-	registro := principal.NovoRegistro()
-	menu := principal.NovoMenu(registro, publicador, os.Stdin, os.Stdout)
-	servico := principal.NovoServico(registro, publicador, menu.Avisar)
+	hub := principal.NovoHub()
+	estoque := principal.NovoClienteEstoque(rest.Ambiente("ESTOQUE_URL", urlEstoquePadrao))
+	servico := principal.NovoServico(principal.NovoRegistro(), estoque, publicador, hub.Publicar)
 
 	consumidor, err := mensageria.NovoConsumidor(conexao, evento.FilaPrincipal, chaveiro)
 	if err != nil {
@@ -72,6 +73,7 @@ func executar(ctx context.Context) error {
 	err = consumidor.Vincular(evento.ExchangeECommerce,
 		evento.PedidoEstoqueOK,
 		evento.EstoqueIndisponivel,
+		evento.PagamentoPendente,
 		evento.PagamentoAprovado,
 		evento.PagamentoRecusado,
 		evento.PedidoEnviado,
@@ -80,21 +82,24 @@ func executar(ctx context.Context) error {
 		return err
 	}
 
-	ctxConsumo, pararConsumo := context.WithCancel(ctx)
-	defer pararConsumo()
+	servidor := &http.Server{
+		Addr:    rest.Endereco("GATEWAY_PORTA", portaPadrao),
+		Handler: principal.NovoHandler(servico, hub, origens()),
+	}
 
-	go func() {
-		if err := consumidor.Consumir(ctxConsumo, servico.Tratar); err != nil {
-			menu.Avisar("o consumo parou: " + err.Error())
+	return rest.Rodar(ctx, servidor, func(ctx context.Context) error {
+		return consumidor.Consumir(ctx, servico.Tratar)
+	})
+}
+
+// origens lê FRONTEND_ORIGEM, uma lista separada por vírgulas das origens do
+// frontend liberadas no CORS.
+func origens() []string {
+	var lista []string
+	for _, origem := range strings.Split(rest.Ambiente("FRONTEND_ORIGEM", origensPadrao), ",") {
+		if origem = strings.TrimSpace(origem); origem != "" {
+			lista = append(lista, origem)
 		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		fmt.Println("\nencerrando.")
-		os.Exit(0)
-	}()
-
-	fmt.Printf("log do broker em %s (acompanhe com: tail -f %s)\n", arquivoDeLog, arquivoDeLog)
-	return menu.Rodar(ctx)
+	}
+	return lista
 }

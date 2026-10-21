@@ -1,4 +1,7 @@
-.PHONY: ajuda broker broker-parar broker-logs chaves estoque pagamento principal entrega promocoes c1 c2 observador teste build limpar
+-include .env
+export
+
+.PHONY: ajuda broker broker-parar broker-logs chaves estoque pagamento entrega promocoes principal mock-instalar mock-pagamento frontend observador teste teste-mock zerar build limpar
 
 ajuda:
 	@echo "Broker"
@@ -9,18 +12,23 @@ ajuda:
 	@echo "Chaves"
 	@echo "  make chaves          gera os pares RSA e distribui as chaves publicas"
 	@echo ""
-	@echo "Microsservicos (um por terminal)"
-	@echo "  make estoque         sobe o microsservico Estoque"
-	@echo "  make pagamento       sobe o microsservico Pagamento"
-	@echo "  make principal       sobe o microsservico Principal (menu do sistema)"
-	@echo "  make entrega         sobe o microsservico Entrega        (parte da dupla)"
-	@echo "  make promocoes       sobe o microsservico Promocoes      (parte da dupla)"
-	@echo "  make c1              sobe o consumidor C1 de promocoes   (parte da dupla)"
-	@echo "  make c2              sobe o consumidor C2 de promocoes   (parte da dupla)"
+	@echo "Microsservicos em Go (um por terminal)"
+	@echo "  make estoque         Estoque: saldo no SQLite e GET /produtos em :8081"
+	@echo "  make pagamento       Pagamento: cobranca no Mock e webhook em :8082"
+	@echo "  make entrega         Entrega: nota fiscal e despacho"
+	@echo "  make promocoes       Promocoes: inscricoes no SQLite e e-mails pela Resend"
+	@echo "  make principal       Principal (API Gateway): REST e SSE em :8080"
+	@echo ""
+	@echo "Fora do RabbitMQ (Python)"
+	@echo "  make mock-instalar   cria o venv do Mock e instala as dependencias (uma vez so)"
+	@echo "  make mock-pagamento  sobe o Mock de Pagamento em http://localhost:8090"
+	@echo "  make frontend        serve o frontend em http://localhost:5173"
 	@echo ""
 	@echo "Desenvolvimento"
 	@echo "  make observador      imprime todos os eventos da exchange eCommerce"
-	@echo "  make teste           roda os testes"
+	@echo "  make teste           roda os testes em Go"
+	@echo "  make teste-mock      roda os testes do Mock"
+	@echo "  make zerar           apaga os bancos SQLite (estoque inicial e nenhum inscrito)"
 	@echo "  make build           compila tudo em ./bin"
 	@echo "  make limpar          apaga os binarios"
 
@@ -43,26 +51,36 @@ estoque:
 pagamento:
 	go run ./cmd/pagamento
 
-principal:
-	go run ./cmd/principal
-
 entrega:
 	go run ./cmd/entrega
 
 promocoes:
 	go run ./cmd/promocoes
 
-c1:
-	go run ./cmd/consumidor-c1
+principal:
+	go run ./cmd/principal
 
-c2:
-	go run ./cmd/consumidor-c2
+mock-instalar:
+	python3 -m venv mock-pagamento/.venv
+	mock-pagamento/.venv/bin/pip install -r mock-pagamento/requirements.txt
+
+mock-pagamento:
+	cd mock-pagamento && .venv/bin/python app.py
+
+frontend:
+	cd web && python3 -m http.server 5173
 
 observador:
 	go run ./cmd/observador
 
 teste:
 	go test ./...
+
+teste-mock:
+	cd mock-pagamento && .venv/bin/python -m unittest -v
+
+zerar:
+	rm -f estoque.db promocoes.db
 
 build:
 	go build -o bin/ ./cmd/...

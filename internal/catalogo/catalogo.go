@@ -1,8 +1,8 @@
 // Package catalogo guarda a lista fixa de produtos vendidos pela loja.
 package catalogo
 
-// Produto é uma linha do catálogo. QuantidadeInicial só vale na partida do
-// microsserviço Estoque.
+// Produto é uma linha do catálogo. QuantidadeInicial só vale na carga inicial
+// do banco do Estoque, quando ele ainda não tem produtos.
 type Produto struct {
 	ID                string
 	Nome              string

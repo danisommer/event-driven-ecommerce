@@ -2,7 +2,9 @@ package estoque
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"ecommerce/internal/evento"
 )
@@ -32,7 +34,17 @@ func (p *publicadorFalso) ultimo(t *testing.T) publicado {
 func montar(t *testing.T) (*Servico, *publicadorFalso) {
 	t.Helper()
 	pub := &publicadorFalso{}
-	return NovoServico(pub), pub
+	return NovoServico(abrirBanco(t, filepath.Join(t.TempDir(), "estoque.db")), pub), pub
+}
+
+func abrirBanco(t *testing.T, caminho string) *Repositorio {
+	t.Helper()
+	repositorio, err := AbrirRepositorio(caminho)
+	if err != nil {
+		t.Fatalf("abrindo banco de teste: %v", err)
+	}
+	t.Cleanup(func() { repositorio.Fechar() })
+	return repositorio
 }
 
 func pedidoCriado(t *testing.T, pedidoID string, itens ...evento.ItemPedido) evento.Envelope {
@@ -73,9 +85,90 @@ func tratar(t *testing.T, s *Servico, env evento.Envelope) {
 
 func exigirSaldo(t *testing.T, s *Servico, produtoID string, esperado int) {
 	t.Helper()
-	if s.saldo[produtoID] != esperado {
-		t.Fatalf("saldo de %s: esperava %d, veio %d", produtoID, esperado, s.saldo[produtoID])
+	produto, existe, err := s.Produto(context.Background(), produtoID)
+	if err != nil || !existe {
+		t.Fatalf("buscando %s: existe=%v, erro=%v", produtoID, existe, err)
 	}
+	if produto.Quantidade != esperado {
+		t.Fatalf("saldo de %s: esperava %d, veio %d", produtoID, esperado, produto.Quantidade)
+	}
+}
+
+func promocaoCriada(t *testing.T, produtoID string, preco float64, validaAte time.Time) evento.Envelope {
+	t.Helper()
+	env, err := evento.NovoEnvelope(evento.PromocaoCriada, evento.ServicoPromocoes, evento.DadosPromocaoCriada{
+		ProdutoID:        produtoID,
+		PrecoPromocional: preco,
+		Desconto:         12,
+		ValidaAte:        validaAte,
+	})
+	if err != nil {
+		t.Fatalf("montando promocao.criada: %v", err)
+	}
+	return env
+}
+
+func exigirPreco(t *testing.T, s *Servico, produtoID string, preco, original float64) {
+	t.Helper()
+	produto, existe, err := s.Produto(context.Background(), produtoID)
+	if err != nil || !existe {
+		t.Fatalf("buscando %s: existe=%v, erro=%v", produtoID, existe, err)
+	}
+	if produto.Preco != preco || produto.PrecoOriginal != original {
+		t.Fatalf("preço de %s: esperava %.2f (original %.2f), veio %.2f (original %.2f)",
+			produtoID, preco, original, produto.Preco, produto.PrecoOriginal)
+	}
+}
+
+func TestPromocaoValidaMudaOPrecoDoProduto(t *testing.T) {
+	s, _ := montar(t)
+
+	tratar(t, s, promocaoCriada(t, "P005", 167.2, time.Now().Add(time.Hour)))
+
+	exigirPreco(t, s, "P005", 167.2, 190)
+	exigirPreco(t, s, "P001", 4500, 0)
+}
+
+func TestPromocaoNovaSubstituiAAnterior(t *testing.T) {
+	s, _ := montar(t)
+
+	tratar(t, s, promocaoCriada(t, "P005", 167.2, time.Now().Add(time.Hour)))
+	tratar(t, s, promocaoCriada(t, "P005", 150, time.Now().Add(time.Hour)))
+
+	exigirPreco(t, s, "P005", 150, 190)
+}
+
+func TestPromocaoVencidaNaoValeMais(t *testing.T) {
+	s, _ := montar(t)
+
+	tratar(t, s, promocaoCriada(t, "P005", 167.2, time.Now().Add(-time.Minute)))
+
+	exigirPreco(t, s, "P005", 190, 0)
+}
+
+func TestPromocaoDeProdutoInexistenteEDescartada(t *testing.T) {
+	s, _ := montar(t)
+
+	if err := s.Tratar(context.Background(), promocaoCriada(t, "P999", 10, time.Now().Add(time.Hour))); err == nil {
+		t.Fatal("uma promoção de produto inexistente deveria ser recusada")
+	}
+}
+
+func TestSaldoEReservaSobrevivemAReabrirOBanco(t *testing.T) {
+	caminho := filepath.Join(t.TempDir(), "estoque.db")
+
+	primeiro, err := AbrirRepositorio(caminho)
+	if err != nil {
+		t.Fatalf("abrindo banco: %v", err)
+	}
+	tratar(t, NovoServico(primeiro, &publicadorFalso{}), pedidoCriado(t, "PED-13", item("P001", 3)))
+	primeiro.Fechar()
+
+	reaberto := NovoServico(abrirBanco(t, caminho), &publicadorFalso{})
+	exigirSaldo(t, reaberto, "P001", 7)
+
+	tratar(t, reaberto, pedidoExcluido(t, "PED-13", "cancelado depois de reiniciar"))
+	exigirSaldo(t, reaberto, "P001", 10)
 }
 
 func TestPedidoDisponivelBaixaEstoqueEPublicaEstoqueOK(t *testing.T) {
