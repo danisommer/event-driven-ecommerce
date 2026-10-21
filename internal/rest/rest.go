@@ -1,6 +1,6 @@
 // Package rest reúne o que os microsserviços com API HTTP fazem igual: ler a
-// porta do ambiente, responder JSON e atender HTTP junto com o consumo da
-// fila, encerrando os dois quando o processo recebe Ctrl+C.
+// configuração do ambiente, responder JSON e atender HTTP junto com o consumo
+// da fila, encerrando os dois quando o processo recebe Ctrl+C.
 package rest
 
 import (

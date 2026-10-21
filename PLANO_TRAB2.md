@@ -1,43 +1,17 @@
+Situação: fases 0 a 8 implementadas. O que falta é validação, marcada com `[ ]`.
 
 ## Decisões
 
 - [X] Stack do frontend (linguagem diferente de Go): HTML/CSS/JS e Python para eventuais servidores/backend
 - [X] Persistência do Estoque e das inscrições: SQLite
 - [X] E-mail: conta na Resend criada; a chave fica no `.env` da raiz (fora do git) e o Makefile a carrega
-package main
-
-import (
-    "log"
-    "os"
-
-    "github.com/resend/resend-go/v4"
-)
-
-func main() {
-    apiKey := os.Getenv("RESEND_API_KEY")
-
-    client := resend.NewClient(apiKey)
-
-    params := &resend.SendEmailRequest{
-        From:    "onboarding@resend.dev",
-        To:      []string{"danibee2005@gmail.com"},
-        Subject: "Hello World",
-        Html:    "<p>Congrats on sending your <strong>first email</strong>!</p>",
-    }
-
-    sent, err := client.Emails.Send(params)
-    if err != nil {
-        log.Fatalf("failed to send email: %v", err)
-    }
-
-    log.Printf("email sent: %s", sent.Id)
-}
-
+- [X] Integração com a Resend feita com `net/http` (`POST https://api.resend.com/emails`), sem o SDK `resend-go`
 - [X] Remover o menu de terminal e os consumidores C1/C2: Sim
 - [X] Regra de linguagem: o que fala com o RabbitMQ é Go; o que não fala (Mock de Pagamento, servidor do frontend) é Python
 - [X] Mock de Pagamento em Python, no mesmo repo, sem acesso ao RabbitMQ nem às chaves
 - [X] Eventos novos: `interesse.promocao`, `interesse.cancelado`, `pagamento.pendente`
 - [X] Status do pedido expostos como código (tabela 0.4)
+- [X] Promoção vale no pedido: o Promoções publica `promocao.criada` e o Estoque, dono do preço, aplica o desconto (fase 8)
 
 | Código | Evento que leva a ele | Pedido no enunciado | Encerrado |
 |---|---|---|---|
@@ -58,10 +32,10 @@ func main() {
 |---|---|---|---|
 | Frontend (HTML/CSS/JS, servido por Python) | 5173 | Gateway | — |
 | Gateway (Principal) | 8080 | Estoque | publica `pedido.*` e `interesse.*`; consome os status |
-| Estoque | 8081 | — | consome `pedido.criado` e `pedido.excluido` |
-| Pagamento | 8082 | Mock | consome `pedido.estoque_ok`; publica `pagamento.*` |
+| Estoque | 8081 | — | consome `pedido.criado`, `pedido.excluido` e `promocao.criada` |
+| Pagamento | 8082 | Mock | consome `pedido.estoque_ok` e `pedido.excluido`; publica `pagamento.*` |
 | Entrega | — | — | consome `pagamento.aprovado`; publica `pedido.enviado` |
-| Promoções | — | Resend | consome `interesse.*` |
+| Promoções | — | Resend | consome `interesse.*`; publica `promocao.criada` |
 | Mock de Pagamento (Python) | 8090 | Pagamento (webhook) | — (sistema externo) |
 | RabbitMQ | 5672 / 15672 | — | — |
 
@@ -77,7 +51,8 @@ Fluxo do pedido:
 Fluxo de promoções:
 
 1. Frontend `POST /interesses` → Gateway publica `interesse.promocao` → Promoções grava a inscrição.
-2. O gerador de promoções sorteia uma promoção, busca os inscritos da categoria e envia um e-mail para cada um pela Resend.
+2. O gerador de promoções sorteia uma promoção entre as categorias com inscritos e publica `promocao.criada`; o Estoque guarda o preço promocional até a validade.
+3. Só então o Promoções envia um e-mail a cada inscrito da categoria pela Resend. Os pedidos seguintes do produto já saem com o desconto.
 
 ---
 
@@ -99,6 +74,7 @@ Objetivo: fixar tudo que cruza a fronteira entre processos antes de escrever os 
 | `pedido.enviado` | Entrega | Gateway | `DadosPedidoEnviado` | existe |
 | `interesse.promocao` | Gateway | Promoções | `DadosInteressePromocao` | **novo** |
 | `interesse.cancelado` | Gateway | Promoções | `DadosInteresseCancelado` | **novo** |
+| `promocao.criada` | Promoções | Estoque | `DadosPromocaoCriada` | **novo** (fase 8) |
 
 Payloads novos:
 
@@ -106,6 +82,7 @@ Payloads novos:
 DadosPagamentoPendente   { pedido_id, cobranca_id, url_checkout, valor }
 DadosInteressePromocao   { email, categorias: ["A", "B"] }
 DadosInteresseCancelado  { email }
+DadosPromocaoCriada      { produto_id, preco_promocional, desconto_percentual, valida_ate }
 ```
 
 Semântica:
@@ -190,8 +167,8 @@ Estoque (`:8081`):
 
 | Método | Caminho | Resposta |
 |---|---|---|
-| GET | `/produtos` | 200 `[Produto]`, só os com `quantidade > 0` |
-| GET | `/produtos/{id}` | 200 `Produto` com qualquer quantidade, 404 se não existe |
+| GET | `/produtos` | 200 `[Produto]`, só os com `quantidade > 0`; `preco` já com promoção válida e `preco_original` quando houver |
+| GET | `/produtos/{id}` | 200 `Produto` com qualquer quantidade (mesmas regras de preço), 404 se não existe |
 
 Mock de Pagamento (`:8090`):
 

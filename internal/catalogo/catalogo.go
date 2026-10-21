@@ -1,4 +1,5 @@
-// Package catalogo guarda a lista fixa de produtos vendidos pela loja.
+// Package catalogo guarda a lista fixa de produtos da loja. É a carga inicial
+// do banco do Estoque e a base das promoções e das categorias de interesse.
 package catalogo
 
 // Produto é uma linha do catálogo. QuantidadeInicial só vale na carga inicial

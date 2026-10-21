@@ -1,5 +1,5 @@
-// Package evento define o envelope comum a todos os eventos do sistema, os
-// nomes das exchanges e as routing keys usadas pelos microsserviços.
+// Package evento define o contrato entre os microsserviços: o envelope comum
+// a todos os eventos, a exchange, as routing keys, as filas e os payloads.
 package evento
 
 import (

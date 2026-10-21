@@ -1,5 +1,5 @@
 // Package mensageria envolve o cliente AMQP e concentra tudo que os
-// microsserviços fazem igual: conectar no broker, declarar as exchanges,
+// microsserviços fazem igual: conectar no broker, declarar a exchange,
 // publicar eventos já assinados e consumir eventos validando a assinatura.
 package mensageria
 
@@ -62,8 +62,8 @@ func Conectar(url string) (*Conexao, error) {
 	return nil, fmt.Errorf("não consegui conectar em %s: %w", url, ultimoErro)
 }
 
-// DeclararExchanges cria as exchanges do sistema como durable, se ainda não
-// existirem.
+// DeclararExchanges cria a exchange eCommerce como durable, se ainda não
+// existir.
 func (c *Conexao) DeclararExchanges() error {
 	exchanges := []struct {
 		nome string

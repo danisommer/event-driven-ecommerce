@@ -10,6 +10,20 @@ Regra de linguagem: o que fala com o RabbitMQ é Go; o que não fala (Mock de
 Pagamento e servidor do frontend) é Python; o frontend é HTML, CSS e
 JavaScript.
 
+## Tecnologias
+
+| Parte | Tecnologia |
+|---|---|
+| Microsserviços | Go 1.26, só biblioteca padrão para HTTP: rotas do `net/http` (`GET /produtos/{id}`) e SSE com `http.ResponseController` |
+| Mensageria | RabbitMQ 3.13 em Docker Compose; cliente `github.com/rabbitmq/amqp091-go` |
+| Assinatura dos eventos | RSA 2048 com SHA-256 (PKCS#1 v1.5), pacote `crypto/rsa` |
+| Persistência | SQLite pelo `modernc.org/sqlite` (Go puro, sem cgo), um banco por serviço |
+| Tempo real | Server-Sent Events (`text/event-stream`) no Gateway e `EventSource` no navegador |
+| Frontend | HTML, CSS e JavaScript sem framework (`fetch`, `EventSource`, `localStorage`), servido pelo `http.server` do Python |
+| Provedor de pagamento | Python 3 com Flask 3.1 e `requests`, em venv |
+| E-mail | API HTTP da Resend (`POST https://api.resend.com/emails`), chamada com `net/http` |
+| Testes | `go test` com `httptest` e SQLite temporário; `unittest` com o cliente de teste do Flask |
+
 ## Arquitetura
 
 ```
@@ -37,6 +51,27 @@ Estoque     Pagamento (Go, :8082)  Entrega     Promoções (Go, SQLite)
 | Promoções | Go | — | `make promocoes` | guarda as inscrições no SQLite, cria as promoções e as envia por e-mail |
 | Mock de Pagamento | Python (Flask) | 8090 | `make mock-pagamento` | provedor de pagamento externo: página com "Aprovado" e "Recusado" |
 | RabbitMQ | — | 5672 / 15672 | `make broker` | broker; painel em http://localhost:15672 (guest / guest) |
+
+## Estrutura do repositório
+
+```
+cmd/                um main por processo (principal, estoque, pagamento, entrega, promocoes)
+                    e as ferramentas (gerar-chaves, observador, teste-publicador)
+internal/
+  principal/        API Gateway: rotas REST, hub SSE, registro dos pedidos, cliente do Estoque
+  estoque/          regras de reserva, repositório SQLite (saldo, reservas, promoções), API HTTP
+  pagamento/        cliente do provedor, estado das cobranças, rota do webhook
+  entrega/          nota fiscal e despacho
+  promocoes/        inscrições no SQLite, geração das promoções, envio de e-mail
+  evento/           envelope, routing keys, filas e payloads: o contrato entre os serviços
+  mensageria/       conexão, publicador e consumidor do RabbitMQ (assina e valida)
+  cripto/           chaves RSA, assinatura e verificação
+  rest/             o que as APIs HTTP têm em comum (porta, JSON, servidor junto do consumidor)
+  catalogo/         catálogo fixo: carga inicial do Estoque e base das promoções
+mock-pagamento/     provedor de pagamento externo (Flask)
+web/                frontend
+chaves/             par de chaves RSA de cada serviço
+```
 
 ## Como rodar
 
@@ -230,6 +265,43 @@ iniciais e ninguém fica inscrito.
 | P007 | Camiseta algodão | C | R$ 79,90 | 100 |
 | P008 | Tênis de corrida | C | R$ 350,00 | 30 |
 | P009 | Mochila 30L | C | R$ 210,00 | 12 |
+
+## Decisões de projeto
+
+- **Eventos entre serviços, REST só nas bordas.** O REST aparece entre
+  frontend e Gateway, entre Gateway e Estoque (consulta de produtos) e entre
+  Pagamento e Mock. Todo o resto passa pelo RabbitMQ.
+- **`POST /pedidos` responde `202 Accepted`.** O pedido é aceito e processado
+  de forma assíncrona; o resultado chega pelo SSE.
+- **O preço vem do Estoque.** O frontend manda só produto e quantidade; o
+  Gateway busca nome e preço (já com promoção) no Estoque.
+- **Quem decide se há estoque é o Estoque**, numa transação que confere o saldo
+  e baixa a reserva de uma vez. O Gateway não confere saldo.
+- **A URL do pagamento chega por evento** (`pagamento.pendente`), porque ela só
+  existe depois que o estoque confirma, quando a resposta do `POST` já foi.
+- **Status como códigos estáveis** (`aguardando_pagamento`, …): o frontend
+  decide por eles e traduz para o texto que mostra.
+- **Idempotência:** reentrega de evento ou webhook repetido não reserva, não
+  cobra e não publica duas vezes.
+- **Pedido encerrado ignora eventos atrasados**, e o Pagamento cancela a
+  cobrança de um pedido excluído, para um pedido cancelado não ser despachado.
+- **O SSE nunca trava o consumidor do RabbitMQ:** cada conexão tem uma fila
+  curta; a que não acompanha é derrubada, e o navegador reconecta e busca o
+  estado atual.
+- **A promoção só é anunciada depois de registrada no Estoque**, para o e-mail
+  nunca prometer um preço que a loja não cobra.
+
+## Limitações conhecidas
+
+- Pedidos (Gateway) e cobranças (Pagamento e Mock) ficam em memória: reiniciar
+  o processo apaga.
+- Não há login: o `cliente_id` gerado no navegador identifica o cliente.
+- O webhook do Mock não é autenticado; provedores reais assinam o webhook (por
+  exemplo, com HMAC).
+- Preços em ponto flutuante, como no Trab1; o certo seria centavos inteiros.
+- No modo de testes da Resend, só o e-mail dono da conta recebe.
+- O catálogo do frontend mostra uma promoção nova ao recarregar a página ou no
+  próximo evento de pedido.
 
 ## Roteiro de demonstração
 
