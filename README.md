@@ -1,5 +1,9 @@
 # E-commerce em microsserviços
 
+![Pedido acompanhado ao vivo: estoque confirmado, pagamento aprovado no provedor externo e pedido enviado](docs/demo/ecommerce-demo.gif)
+
+O vídeo completo da demonstração, de ponta a ponta, está no meu portfólio.
+
 Loja virtual dividida em microsserviços. O frontend web fala por REST com um
 API Gateway, que recebe as mudanças de status dos pedidos em tempo real por
 SSE. Os serviços de domínio conversam só por eventos no RabbitMQ, todos
