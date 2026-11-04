@@ -16,11 +16,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"ecommerce/internal/cripto"
-	"ecommerce/internal/evento"
-	"ecommerce/internal/mensageria"
-	"ecommerce/internal/pagamento"
-	"ecommerce/internal/rest"
+	"ecommerce/internal/comum/cripto"
+	"ecommerce/internal/comum/evento"
+	"ecommerce/internal/comum/mensageria"
+	"ecommerce/internal/comum/rest"
+	"ecommerce/internal/servicos/pagamento"
 )
 
 const (

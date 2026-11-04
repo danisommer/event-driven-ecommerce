@@ -59,22 +59,23 @@ Estoque     Pagamento (Go, :8082)  Entrega     Promoções (Go, SQLite)
 ## Estrutura do repositório
 
 ```
-cmd/                um main por processo (principal, estoque, pagamento, entrega, promocoes)
-                    e as ferramentas (gerar-chaves, observador, teste-publicador)
+cmd/                  um main por microsserviço (principal, estoque, pagamento, entrega, promocoes)
 internal/
-  principal/        API Gateway: rotas REST, hub SSE, registro dos pedidos, cliente do Estoque
-  estoque/          regras de reserva, repositório SQLite (saldo, reservas, promoções), API HTTP
-  pagamento/        cliente do provedor, estado das cobranças, rota do webhook
-  entrega/          nota fiscal e despacho
-  promocoes/        inscrições no SQLite, geração das promoções, envio de e-mail
-  evento/           envelope, routing keys, filas e payloads: o contrato entre os serviços
-  mensageria/       conexão, publicador e consumidor do RabbitMQ (assina e valida)
-  cripto/           chaves RSA, assinatura e verificação
-  rest/             o que as APIs HTTP têm em comum (porta, JSON, servidor junto do consumidor)
-  catalogo/         catálogo fixo: carga inicial do Estoque e base das promoções
-mock-pagamento/     provedor de pagamento externo (Flask)
-web/                frontend
-chaves/             par de chaves RSA de cada serviço
+  servicos/           a regra de cada microsserviço
+    principal/        API Gateway: rotas REST, hub SSE, registro dos pedidos, cliente do Estoque
+    estoque/          regras de reserva, repositório SQLite (saldo, reservas, promoções), API HTTP
+    pagamento/        cliente do provedor, estado das cobranças, rota do webhook
+    entrega/          nota fiscal e despacho
+    promocoes/        inscrições no SQLite, geração das promoções, envio de e-mail
+  comum/              o que todos os microsserviços usam
+    evento/           envelope, routing keys, filas e payloads: o contrato entre os serviços
+    mensageria/       conexão, publicador e consumidor do RabbitMQ (assina e valida)
+    cripto/           chaves RSA, assinatura e verificação
+    rest/             o que as APIs HTTP têm em comum (porta, JSON, servidor junto do consumidor)
+    catalogo/         catálogo fixo: carga inicial do Estoque e base das promoções
+mock-pagamento/       provedor de pagamento externo (Flask)
+web/                  frontend
+chaves/               par de chaves RSA de cada serviço
 ```
 
 ## Como rodar
@@ -333,15 +334,12 @@ Com tudo no ar (de preferência depois de `make zerar`):
    Cancele a inscrição e os envios param.
 9. **Assinatura:** publique o evento falso da seção acima.
 
-`make observador` mostra todos os eventos passando pela exchange num terminal
-só.
-
 ## Testes
 
 ```bash
 make teste                              # Go, sem precisar do broker
 make teste-mock                         # Mock de Pagamento (unittest)
-go test -race ./internal/principal/     # concorrência do Gateway (precisa de gcc)
+go test -race ./internal/servicos/principal/   # concorrência do Gateway (precisa de gcc)
 ```
 
 Os serviços recebem publicador, provedor, Estoque e notificador por interface,
@@ -369,31 +367,6 @@ e os testes injetam versões falsas. Os bancos de teste são SQLite temporários
 | `PROMOCOES_BANCO` | `promocoes.db` | Promoções |
 | `PROMOCOES_INTERVALO` | `2m` | Promoções |
 
-## Ferramentas de desenvolvimento
-
-**`make observador`** imprime todo evento que passa pela exchange `eCommerce`.
-
-**`teste-publicador`** publica `pedido.criado` ou `pedido.excluido` assinado,
-sem passar pelo Gateway:
-
-```bash
-go run ./cmd/teste-publicador -itens P001:2,P004:1   # pedido que cabe no estoque
-go run ./cmd/teste-publicador -itens P006:99         # pedido sem estoque
-go run ./cmd/teste-publicador -tipo pedido.excluido -pedido PED-001 -motivo teste
-```
-
-| Flag | Padrão | Para que serve |
-|---|---|---|
-| `-tipo` | `pedido.criado` | `pedido.criado` ou `pedido.excluido` |
-| `-pedido` | gerado pelo horário | ID do pedido |
-| `-itens` | `P001:1` | itens no formato `PRODUTO:QTD,PRODUTO:QTD` |
-| `-cliente` | `cliente-teste` | nome do cliente |
-| `-motivo` | `cancelado no teste` | motivo do `pedido.excluido` |
-| `-como` | `principal` | serviço cuja chave assina o evento |
-
-Pedidos publicados assim não aparecem no frontend, porque o Gateway não os
-conhece; o resto do fluxo (Estoque, Pagamento, Mock, Entrega) funciona igual.
-
 ## Chaves
 
 ```
@@ -403,5 +376,5 @@ chaves/
     publicas/     chaves públicas de todos, para validar o que chega
 ```
 
-As chaves estão versionadas para todos usarem o mesmo conjunto. `make chaves`
-preserva as existentes; `go run ./cmd/gerar-chaves -forcar` regera tudo.
+São pares RSA de 2048 bits em PEM, versionados para todos usarem o mesmo
+conjunto.

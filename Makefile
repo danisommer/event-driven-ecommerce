@@ -1,16 +1,13 @@
 -include .env
 export
 
-.PHONY: ajuda broker broker-parar broker-logs chaves estoque pagamento entrega promocoes principal mock-instalar mock-pagamento frontend observador teste teste-mock zerar build limpar
+.PHONY: ajuda broker broker-parar broker-logs estoque pagamento entrega promocoes principal mock-instalar mock-pagamento frontend teste teste-mock zerar build limpar
 
 ajuda:
 	@echo "Broker"
 	@echo "  make broker          sobe o RabbitMQ (painel em http://localhost:15672, guest/guest)"
 	@echo "  make broker-parar    derruba o RabbitMQ"
 	@echo "  make broker-logs     acompanha o log do broker"
-	@echo ""
-	@echo "Chaves"
-	@echo "  make chaves          gera os pares RSA e distribui as chaves publicas"
 	@echo ""
 	@echo "Microsservicos em Go (um por terminal)"
 	@echo "  make estoque         Estoque: saldo, reservas e promocoes no SQLite; GET /produtos em :8081"
@@ -25,7 +22,6 @@ ajuda:
 	@echo "  make frontend        serve o frontend em http://localhost:5173"
 	@echo ""
 	@echo "Desenvolvimento"
-	@echo "  make observador      imprime todos os eventos da exchange eCommerce"
 	@echo "  make teste           roda os testes em Go"
 	@echo "  make teste-mock      roda os testes do Mock"
 	@echo "  make zerar           apaga os bancos SQLite (estoque inicial e nenhum inscrito)"
@@ -41,9 +37,6 @@ broker-parar:
 
 broker-logs:
 	docker compose logs -f rabbitmq
-
-chaves:
-	go run ./cmd/gerar-chaves
 
 estoque:
 	go run ./cmd/estoque
@@ -69,9 +62,6 @@ mock-pagamento:
 
 frontend:
 	cd web && python3 -m http.server 5173
-
-observador:
-	go run ./cmd/observador
 
 teste:
 	go test ./...
